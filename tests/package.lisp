@@ -1,0 +1,34 @@
+;;;; sat-protocol/tests: the protocol's own tests, plus the conformance suite
+;;;; run against REFERENCE-BACKEND (the test oracle; sat-protocol has no backend
+;;;; inside). RUN-WITH-REFERENCE-BACKEND is what test-op calls.
+
+(defpackage #:sat-protocol/tests
+  (:use #:cl #:rove #:sat-protocol)
+  (:import-from #:sat-protocol/conformance
+                #:reference-backend
+                #:f
+                #:make-rng
+                #:rng-int
+                #:random-sexp
+                #:sexp-eval
+                #:sexp-vars
+                #:all-assignments
+                #:clauses->cnf
+                #:fixture-path)
+  (:export #:run-with-reference-backend))
+
+(in-package #:sat-protocol/tests)
+
+(defun run-with-reference-backend (&key (style :spec))
+  "Run sat-protocol/tests and sat-protocol/conformance (on REFERENCE-BACKEND)
+in one Rove run. Returns true when everything passes."
+  (let ((*sat-backend* (make-instance 'reference-backend)))
+    (rove:run '("sat-protocol/conformance" "sat-protocol/tests") :style style)))
+
+(defun sx (formula)
+  "FORMULA->SEXP shorthand."
+  (formula->sexp formula))
+
+(defun fsx (sexp)
+  "Fold SEXP through the constructors and print it back."
+  (formula->sexp (sexp->formula sexp)))

@@ -1,0 +1,130 @@
+;;;; Conditions and restarts (CLHS 9). GIVEN (not stubs), except %SAT-PENDING.
+;;;;
+;;;; SAT-INVALID-FORMULA    A constructor operand that is not a formula, a SAT-VAR
+;;;;                        name of NIL, or a bad sexp in SEXP->FORMULA. Signalled
+;;;;                        inside RESTART-CASE with USE-VALUE (value): use VALUE
+;;;;                        instead (a formula, or for SAT-VAR a name; it is
+;;;;                        checked again).
+;;;; SAT-UNBOUND-VARIABLE   FORMULA-EVAL met a variable the assignment does not
+;;;;                        bind (and no :DEFAULT was given). USE-VALUE (boolean):
+;;;;                        use it for this occurrence.
+;;;; SAT-NO-BACKEND         A front end (SOLVE, SOLVE-ALL, MINIMIZE, UNSAT-CORE)
+;;;;                        found neither :BACKEND nor *SAT-BACKEND*. USE-BACKEND
+;;;;                        (backend): retry with it. USE-VALUE (value): the front
+;;;;                        end returns (values VALUE NIL).
+;;;; SAT-BUDGET-EXCEEDED    A backend made more decisions than :BUDGET. Signalled by
+;;;;                        SIGNAL-BUDGET-EXCEEDED (backends call it). CONTINUE:
+;;;;                        double the budget and keep searching. USE-VALUE (value):
+;;;;                        the front end returns (values VALUE NIL).
+;;;; SAT-DIMACS-ERROR       READ-DIMACS met a malformed line. SKIP-LINE: ignore the
+;;;;                        line. CONTINUE (header count mismatches only): accept
+;;;;                        the actual counts.
+
+(in-package #:sat-protocol)
+
+(define-condition sat-error (error)
+  ((message :initarg :message :reader sat-error-message :initform nil))
+  (:report (lambda (c s)
+             (format s "SAT error~@[: ~A~]" (sat-error-message c))))
+  (:documentation "Root of every sat-protocol condition."))
+
+(define-condition sat-invalid-formula (sat-error)
+  ((datum :initarg :datum :reader sat-invalid-formula-datum :initform nil))
+  (:report (lambda (c s)
+             (format s "Invalid SAT formula~@[ (~A)~]: ~S"
+                     (sat-error-message c) (sat-invalid-formula-datum c))))
+  (:documentation "DATUM is not a formula (or not a valid variable name / sexp)."))
+
+(define-condition sat-unbound-variable (sat-error)
+  ((name :initarg :name :reader sat-unbound-variable-name))
+  (:report (lambda (c s)
+             (format s "SAT variable ~S has no value in the assignment"
+                     (sat-unbound-variable-name c))))
+  (:documentation "FORMULA-EVAL found a variable the assignment does not bind."))
+
+(define-condition sat-no-backend (sat-error)
+  ((formula :initarg :formula :reader sat-no-backend-formula :initform nil))
+  (:report (lambda (c s)
+             (declare (ignore c))
+             (format s "No SAT backend; bind ~S or pass :backend (e.g. load sat-backend-dpll)"
+                     '*sat-backend*)))
+  (:documentation "A front end found no backend for FORMULA."))
+
+(define-condition sat-budget-exceeded (sat-error)
+  ((budget :initarg :budget :reader sat-budget-exceeded-budget))
+  (:report (lambda (c s)
+             (format s "SAT search exceeded its budget of ~D decision~:P"
+                     (sat-budget-exceeded-budget c))))
+  (:documentation "A backend made more decisions than the :BUDGET of the call."))
+
+(define-condition sat-dimacs-error (sat-error)
+  ((line :initarg :line :reader sat-dimacs-error-line :initform nil)
+   (line-number :initarg :line-number :reader sat-dimacs-error-line-number :initform nil))
+  (:report (lambda (c s)
+             (format s "DIMACS error~@[ at line ~D~]~@[: ~A~]~@[ in ~S~]"
+                     (sat-dimacs-error-line-number c)
+                     (sat-error-message c)
+                     (sat-dimacs-error-line c))))
+  (:documentation "Malformed DIMACS input. LINE is the offending text (1-based LINE-NUMBER)."))
+
+;;; Restart helpers. CL's USE-VALUE and CONTINUE cover the others.
+
+(defun use-backend (backend &optional condition)
+  "Invoke the USE-BACKEND restart of SAT-NO-BACKEND (retry with BACKEND)."
+  (let ((restart (find-restart 'use-backend condition)))
+    (if restart
+        (invoke-restart restart backend)
+        (error 'control-error))))
+
+(defun skip-line (&optional condition)
+  "Invoke the SKIP-LINE restart of SAT-DIMACS-ERROR (ignore the line)."
+  (let ((restart (find-restart 'skip-line condition)))
+    (if restart
+        (invoke-restart restart)
+        (error 'control-error))))
+
+;;; Front-end exits. Every front end (SOLVE, SOLVE-ALL's NEXT-MODEL, MINIMIZE,
+;;; UNSAT-CORE) runs its body inside (CATCH '%SAT-FRONT-VALUE ...), so the
+;;; USE-VALUE restarts below make that call return (values VALUE NIL).
+
+(defun %front-value (value)
+  (throw '%sat-front-value (values value nil)))
+
+(defun signal-budget-exceeded (budget)
+  "For backends: call when the search has made more than BUDGET decisions.
+Signals SAT-BUDGET-EXCEEDED. Returns the new budget (2 x BUDGET, at least 1)
+when the handler invokes CONTINUE; USE-VALUE makes the front end return."
+  (restart-case (error 'sat-budget-exceeded :budget budget)
+    (continue ()
+      :report "Double the budget and keep searching."
+      (* 2 (max budget 1)))
+    (use-value (value)
+      :report "Stop searching; the call returns VALUE."
+      (%front-value value))))
+
+(defun %resolve-backend (backend formula)
+  "BACKEND, else *SAT-BACKEND*, else signal SAT-NO-BACKEND with USE-BACKEND
+(retry with that backend) and USE-VALUE (the front end returns the value)."
+  (loop
+    (let ((b (or backend (symbol-value '*sat-backend*))))
+      (when b (return b))
+      (restart-case (error 'sat-no-backend :formula formula)
+        (use-backend (new)
+          :report "Retry with another backend."
+          (setf backend new))
+        (use-value (value)
+          :report "Return a value instead."
+          (%front-value value))))))
+
+;;; Contract stub marker. Every call site is replaced by the L2 implementation;
+;;; nothing may call it when the slice is done.
+
+(define-condition sat-pending (error)
+  ((what :initarg :what :reader sat-pending-what))
+  (:report (lambda (c s)
+             (format s "L2 sat-protocol contract stub not implemented: ~S"
+                     (sat-pending-what c)))))
+
+(defun %sat-pending (what)
+  "Contract stub. Every call site is replaced by the L2 implementation."
+  (error 'sat-pending :what what))
