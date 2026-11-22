@@ -1,0 +1,6 @@
+c every assignment of x1, x2 falsifies a clause; written for sat-protocol (MIT)
+p cnf 2 4
+1 2 0
+-1 2 0
+1 -2 0
+-1 -2 0

@@ -1,0 +1,9 @@
+c SATLIB layout: clauses spanning lines, a blank line, and a "%" end marker
+c written for sat-protocol (MIT)
+p cnf 4 3
+ 1 -2
+   3 0
+
+-1 4 0 2 -3 0
+%
+0
