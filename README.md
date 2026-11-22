@@ -4,6 +4,12 @@ Propositional satisfiability for [cl-stack](https://github.com/egao1980/cl-stack
 
 **Status:** planned (slice L2, Track L). Brief: [cl-stack/docs/capabilities/logic.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/logic.md). First backend: [`sat-backend-dpll`](https://github.com/egao1980/sat-backend-dpll). Independent of logic-protocol.
 
+## Systems
+
+- `sat-protocol`: formulas (`sat-var`, `sat-and`, ..., constant folding), CNF (`to-cnf`), DIMACS, models, the backend GFs and the front ends. No dependencies.
+- `sat-protocol/conformance`: the Rove suite every backend runs on itself (`(sat-protocol/conformance:run-conformance backend)`), with `reference-backend`, a test oracle that ports cl-repository's naive search.
+- `sat-protocol/tests`: the protocol's own tests plus the conformance suite on `reference-backend`.
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
