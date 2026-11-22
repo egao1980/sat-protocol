@@ -1,4 +1,4 @@
-;;;; Conditions and restarts (CLHS 9). GIVEN (not stubs), except %SAT-PENDING.
+;;;; Conditions and restarts (CLHS 9). GIVEN.
 ;;;;
 ;;;; SAT-INVALID-FORMULA    A constructor operand that is not a formula, a SAT-VAR
 ;;;;                        name of NIL, or a bad sexp in SEXP->FORMULA. Signalled
@@ -115,16 +115,3 @@ when the handler invokes CONTINUE; USE-VALUE makes the front end return."
         (use-value (value)
           :report "Return a value instead."
           (%front-value value))))))
-
-;;; Contract stub marker. Every call site is replaced by the L2 implementation;
-;;; nothing may call it when the slice is done.
-
-(define-condition sat-pending (error)
-  ((what :initarg :what :reader sat-pending-what))
-  (:report (lambda (c s)
-             (format s "L2 sat-protocol contract stub not implemented: ~S"
-                     (sat-pending-what c)))))
-
-(defun %sat-pending (what)
-  "Contract stub. Every call site is replaced by the L2 implementation."
-  (error 'sat-pending :what what))

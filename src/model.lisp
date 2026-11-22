@@ -1,4 +1,4 @@
-;;;; Models and lazy model sequences. Bodies are stubs.
+;;;; Models and lazy model sequences.
 ;;;;
 ;;;; A model is an alist ((name . boolean) ...) over user variables (never
 ;;;; Tseitin auxiliaries), in CNF index order: for a formula that is
@@ -21,13 +21,29 @@
   (:documentation "Lazy sequence of models, from SOLVE-ALL."))
 
 (defun model-value (model name)
-  (declare (ignore model name))
-  (%sat-pending 'model-value))
+  (let ((cell (assoc name model :test #'equal)))
+    (if cell
+        (values (cdr cell) t)
+        (values nil nil))))
 
 (defun next-model (sequence)
-  (declare (ignore sequence))
-  (%sat-pending 'next-model))
+  (if (%model-sequence-done sequence)
+      (values nil nil)
+      (let ((more nil))
+        (unwind-protect
+             (multiple-value-bind (model ok)
+                 (catch '%sat-front-value
+                   (funcall (%model-sequence-generator sequence)))
+               (setf more ok)
+               (values model ok))
+          ;; Exhaustion, a USE-VALUE exit and any non-local exit end the
+          ;; sequence: a half-run generator is never re-entered.
+          (unless more
+            (setf (%model-sequence-done sequence) t))))))
 
 (defun collect-models (sequence)
-  (declare (ignore sequence))
-  (%sat-pending 'collect-models))
+  (let ((models '()))
+    (loop
+      (multiple-value-bind (model ok) (next-model sequence)
+        (unless ok (return (nreverse models)))
+        (push model models)))))

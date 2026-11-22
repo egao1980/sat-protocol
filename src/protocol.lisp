@@ -1,5 +1,5 @@
 ;;;; Backends and front ends. Specials, classes and GF lambda lists are GIVEN;
-;;;; the default methods and the front ends are stubs.
+;;;; the default methods and the front ends are implemented here.
 ;;;;
 ;;;; ---------------------------------------------------------------- backends
 ;;;; A backend is an instance of a SAT-BACKEND subclass. It must implement
@@ -103,33 +103,281 @@
 (defgeneric backend-solve-all (backend cnf &key project assumptions)
   (:documentation "Generator of projected models. Default method: blocking clauses.")
   (:method ((backend sat-backend) cnf &key project assumptions)
-    (declare (ignore cnf project assumptions))
-    (%sat-pending 'backend-solve-all)))
+    ;; Each BACKEND-SOLVE answer is a partial assignment P satisfying every
+    ;; clause, so every completion of P is a model. The answer's assigned
+    ;; projected literals form a cube; its completions over the unassigned
+    ;; projected indices are enumerated lazily (an odometer), then the cube is
+    ;; blocked. Cubes are pairwise contradictory, so no model repeats.
+    (let ((work (copy-cnf cnf))
+          (project (remove-duplicates project :from-end t))
+          (cube #())        ; parallel to PROJECT: the answer's literal, or NIL
+          (next 0)          ; odometer over the NIL entries of CUBE
+          (end 0)
+          (last nil)        ; the cube was empty: it covered every model
+          (done nil))
+      (lambda ()
+        (loop
+          (cond ((< next end)
+                 (let ((bits next) (j -1))
+                   (incf next)
+                   (return (values (loop for i in project
+                                         for l across cube
+                                         collect (or l (if (logbitp (incf j) bits) i (- i))))
+                                   t))))
+                ((or done last)
+                 (setf done t)
+                 (return (values nil nil)))
+                (t
+                 (multiple-value-bind (literals sat)
+                     (backend-solve backend work :assumptions assumptions)
+                   (if (not sat)
+                       (setf done t)
+                       (let ((assigned (make-hash-table)))
+                         (dolist (l literals) (setf (gethash (abs l) assigned) l))
+                         (setf cube (map 'vector (lambda (i) (values (gethash i assigned))) project)
+                               next 0
+                               end (ash 1 (count nil cube)))
+                         (let ((block (loop for l across cube when l collect (- l))))
+                           (if block
+                               (cnf-add-clause work block)
+                               (setf last t)))))))))))))
+
+(defun %cheapest-completion (literals objective)
+  "LITERALS plus, for each objective variable they leave unassigned, its
+cheaper value. Returns (values literals cost)."
+  (let ((assigned (make-hash-table))
+        (preference (make-hash-table))   ; variable -> cost(T) - cost(F)
+        (order '()))
+    (dolist (l literals) (setf (gethash (abs l) assigned) (plusp l)))
+    (loop for (weight . l) in objective
+          for v = (abs l)
+          unless (nth-value 1 (gethash v assigned))
+            do (unless (nth-value 1 (gethash v preference)) (push v order))
+               (incf (gethash v preference 0) (if (plusp l) weight (- weight))))
+    (let ((completed (copy-list literals)))
+      (dolist (v (nreverse order))
+        (let ((value (minusp (gethash v preference))))
+          (setf (gethash v assigned) value)
+          (push (if value v (- v)) completed)))
+      (values completed
+              (loop for (weight . l) in objective
+                    when (eq (gethash (abs l) assigned) (plusp l)) sum weight)))))
 
 (defgeneric backend-minimize (backend cnf objective &key assumptions)
   (:documentation "Least-cost model. Default method: iterated BACKEND-SOLVE with a tightened bound.")
   (:method ((backend sat-backend) cnf objective &key assumptions)
-    (declare (ignore cnf objective assumptions))
-    (%sat-pending 'backend-minimize)))
+    ;; Linear SAT-UNSAT descent. After a model of cost C, assert
+    ;; "cost <= C-1" with a BDD over the objective entries: node N(i,k) means
+    ;; "entries i.. weigh at most k when true", clauses (-N -l_i N(i+1,k-w_i))
+    ;; and (-N l_i N(i+1,k)). The node table is shared by every tightening.
+    ;; The bound is clauses, so every completion of a partial answer meets it,
+    ;; and the cheapest completion strictly lowers the cost each round.
+    (let* ((work (copy-cnf cnf))
+           (terms (coerce objective 'vector))
+           (n (length terms))
+           (suffix (make-array (1+ n) :initial-element 0))
+           (memo (make-hash-table :test 'equal))
+           (best-literals nil)
+           (best nil))
+      (loop for i from (1- n) downto 0
+            do (setf (aref suffix i) (+ (aref suffix (1+ i)) (car (aref terms i)))))
+      (labels ((node (i k)
+                 (cond ((minusp k) :false)
+                       ((>= k (aref suffix i)) :true)
+                       (t (let ((key (cons i k)))
+                            (or (gethash key memo)
+                                (setf (gethash key memo)
+                                      (destructuring-bind (weight . l) (aref terms i)
+                                        ;; children first (post-order allocation)
+                                        (let* ((hi (node (1+ i) (- k weight)))
+                                               (lo (node (1+ i) k))
+                                               (x (cnf-ensure-variable work nil)))
+                                          (flet ((imply (lit child)
+                                                   (unless (eq child :true)
+                                                     (cnf-add-clause work (if (eq child :false)
+                                                                              (list (- x) lit)
+                                                                              (list (- x) lit child))))))
+                                            (imply (- l) hi)
+                                            (imply l lo))
+                                          x)))))))))
+        (loop
+          (multiple-value-bind (literals sat)
+              (backend-solve backend work :assumptions assumptions)
+            (unless sat (return))
+            (multiple-value-setq (best-literals best) (%cheapest-completion literals objective))
+            (when (zerop best) (return))
+            (let ((root (node 0 (1- best))))
+              (when (symbolp root) (return)) ; unreachable for 0 < best <= sum of weights
+              (cnf-add-clause work (list root))))))
+      (if best
+          (values best-literals best)
+          (values nil nil)))))
 
 (defgeneric backend-unsat-core (backend cnf assumptions)
   (:documentation "Minimal unsatisfiable subset of ASSUMPTIONS. Default method: deletion.")
   (:method ((backend sat-backend) cnf assumptions)
-    (declare (ignore cnf assumptions))
-    (%sat-pending 'backend-unsat-core)))
+    ;; Deletion: drop each element whose removal keeps the rest UNSAT.
+    ;; Invariant: KEPT ++ REST is UNSAT; a kept element was necessary against
+    ;; a superset of the final core, hence also against the core (monotone).
+    (flet ((sat-p (subset)
+             (nth-value 1 (backend-solve backend cnf :assumptions subset))))
+      (if (sat-p assumptions)
+          (values nil nil)
+          (let ((kept '()))
+            (loop for tail on assumptions
+                  when (sat-p (revappend kept (rest tail)))
+                    do (push (first tail) kept))
+            (values (nreverse kept) t))))))
+
+;;; ------------------------------------------------------------ front ends
+
+(defun %working-cnf (formula)
+  "A private CNF for FORMULA (the caller's object is never modified)."
+  (if (cnf-p formula)
+      (copy-cnf formula)
+      (to-cnf (%check-formula formula))))
+
+(defun %integer-literals (cnf literals)
+  (mapcar (lambda (l) (cnf-literal cnf l)) literals))
+
+(defun %assignment (literals)
+  "Hash table index -> T / NIL."
+  (let ((table (make-hash-table)))
+    (dolist (l literals table)
+      (setf (gethash (abs l) table) (plusp l)))))
+
+(defun %model (cnf literals fill)
+  "User variables in index order. Unassigned ones are bound to (FILL name)
+when FILL is a function, else left out."
+  (let ((assignment (%assignment literals)))
+    (loop for i from 1 to (cnf-variable-count cnf)
+          for name = (cnf-variable-name cnf i)
+          when name
+            if (nth-value 1 (gethash i assignment))
+              collect (cons name (gethash i assignment))
+            else if fill
+                   collect (cons name (and (funcall fill name) t)))))
+
+(defun %order-wrapper (cnf order)
+  "ORDER on names -> the index-level hook BACKEND-SOLVE calls."
+  (lambda (candidates)
+    (let ((user (remove-if (lambda (i) (cnf-aux-variable-p cnf i)) candidates)))
+      (if (null user)
+          (reduce #'min candidates)
+          (let* ((user (sort (copy-list user) #'<))
+                 (names (mapcar (lambda (i) (cnf-variable-name cnf i)) user))
+                 (choice (funcall order names))
+                 (position (position choice names :test #'equal)))
+            (if position
+                (nth position user)
+                (error 'sat-error
+                       :message (format nil ":ORDER returned ~S, not one of ~S" choice names))))))))
+
+(defun %phase-wrapper (cnf phase)
+  "PHASE (:TRUE, :FALSE or a function on names) -> a function on indices."
+  (cond ((eq phase :true) (constantly t))
+        ((eq phase :false) (constantly nil))
+        ((functionp phase)
+         (lambda (i)
+           (let ((name (cnf-variable-name cnf i)))
+             (if name (and (funcall phase name) t) t))))
+        (t (error 'sat-error
+                  :message (format nil ":PHASE must be NIL, :TRUE, :FALSE or a function, not ~S"
+                                   phase)))))
+
+(defun %fill-function (phase)
+  (cond ((eq phase :true) (constantly t))
+        ((functionp phase) phase)
+        (t (constantly nil))))
 
 (defun solve (formula &key assumptions order phase budget backend (complete t))
-  (declare (ignore formula assumptions order phase budget backend complete))
-  (%sat-pending 'solve))
+  (catch '%sat-front-value
+    (let* ((backend (%resolve-backend backend formula))
+           (cnf (%working-cnf formula))
+           (ints (%integer-literals cnf assumptions))
+           (order-hook (and order (%order-wrapper cnf order)))
+           (phase-hook (and phase (%phase-wrapper cnf phase))))
+      (multiple-value-bind (literals sat)
+          (backend-solve backend cnf :assumptions ints :order order-hook
+                                     :phase phase-hook :budget budget)
+        (if sat
+            (values (%model cnf literals (and complete (%fill-function phase))) t)
+            (values nil nil))))))
 
 (defun solve-all (formula &key project limit assumptions backend)
-  (declare (ignore formula project limit assumptions backend))
-  (%sat-pending 'solve-all))
+  (catch '%sat-front-value
+    (let* ((backend (%resolve-backend backend formula))
+           (cnf (%working-cnf formula))
+           (ints (%integer-literals cnf assumptions))
+           (indices (if project
+                        (remove-duplicates (mapcar (lambda (p) (abs (cnf-literal cnf p))) project)
+                                           :from-end t)
+                        (loop for i from 1 to (cnf-variable-count cnf)
+                              unless (cnf-aux-variable-p cnf i) collect i)))
+           (generator nil)
+           (count 0))
+      (make-instance
+       'model-sequence
+       :generator (lambda ()
+                    (if (and limit (>= count limit))
+                        (values nil nil)
+                        (progn
+                          ;; Created on the first NEXT-MODEL: :LIMIT 0 never searches.
+                          (unless generator
+                            (setf generator (backend-solve-all backend cnf :project indices
+                                                                           :assumptions ints)))
+                          (multiple-value-bind (literals ok) (funcall generator)
+                            (if ok
+                                (let ((assignment (%assignment literals)))
+                                  (incf count)
+                                  (values (mapcar (lambda (i)
+                                                    (cons (cnf-variable-name cnf i)
+                                                          (gethash i assignment)))
+                                                  indices)
+                                          t))
+                                (values nil nil))))))))))
 
 (defun minimize (formula objective &key assumptions backend)
-  (declare (ignore formula objective assumptions backend))
-  (%sat-pending 'minimize))
+  (catch '%sat-front-value
+    (let* ((backend (%resolve-backend backend formula))
+           (cnf (%working-cnf formula))
+           (ints-objective
+             (mapcar (lambda (entry)
+                       (check-type entry cons)
+                       (let ((weight (car entry)))
+                         (check-type weight (integer 0 *))
+                         (cons weight (cnf-literal cnf (cdr entry)))))
+                     objective))
+           (ints (%integer-literals cnf assumptions)))
+      (multiple-value-bind (literals cost)
+          (backend-minimize backend cnf ints-objective :assumptions ints)
+        (if cost
+            (values (%model cnf literals (constantly nil)) cost)
+            (values nil nil))))))
 
 (defun unsat-core (formula &key assumptions named backend)
-  (declare (ignore formula assumptions named backend))
-  (%sat-pending 'unsat-core))
+  (catch '%sat-front-value
+    (let* ((backend (%resolve-backend backend formula))
+           (cnf (%working-cnf formula))
+           (ints (%integer-literals cnf assumptions))
+           (selectors
+             (loop for (nil . soft) in named
+                   collect (let ((soft (%check-formula soft)))
+                             (dolist (name (formula-variables soft))
+                               (cnf-ensure-variable cnf name))
+                             ;; An auxiliary selector S with clauses S -> SOFT.
+                             (let ((s (cnf-ensure-variable cnf nil)))
+                               (%add-formula cnf soft s)
+                               s))))
+           (all (append ints selectors))
+           (objects (append assumptions (mapcar #'car named))))
+      (multiple-value-bind (core unsat) (backend-unsat-core backend cnf all)
+        (if unsat
+            ;; By position: CORE is a subsequence of ALL, so walk both.
+            (values (loop for i in all
+                          for object in objects
+                          when (and core (eql i (first core)))
+                            collect object
+                            and do (pop core))
+                    t)
+            (values nil nil))))))
