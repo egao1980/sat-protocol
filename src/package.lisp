@@ -111,10 +111,3 @@
    #:unsat-core))
 
 (in-package #:sat-protocol)
-
-(defun %l2b1-pending (name)
-  "Contract stub for sat-protocol 0.2.0 (Track L, slice L2b-1). Every call is
-replaced by the implementation, then this function is deleted. Signals a
-SIMPLE-ERROR (deliberately not a SAT-ERROR, so no negative test passes on a
-stub)."
-  (error "sat-protocol 0.2 (L2b-1) pending: ~S" name))

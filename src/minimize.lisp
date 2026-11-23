@@ -2,7 +2,8 @@
 ;;;; lexicographic objectives. Specifies the front end MINIMIZE (protocol.lisp)
 ;;;; and the default method of BACKEND-MINIMIZE, which calls %MINIMIZE below
 ;;;; for every 0.2 argument. Signatures GIVEN; %MINIMIZE and the 0.2 path of
-;;;; MINIMIZE are %L2B1-PENDING stubs.
+;;;; MINIMIZE (%MINIMIZE-FRONT) are implemented here (see "implementation"
+;;;; after this header).
 ;;;;
 ;;;; (minimize formula objective &key assumptions backend (strategy :linear-bdd)
 ;;;;                                  budget timeout order phase hint)
@@ -121,14 +122,454 @@
 ;;;; (values LITERALS COST OPTIMAL-P) or (values NIL NIL). The front end checks
 ;;;; every argument before the call, maps LITERALS to the complete MODEL (as
 ;;;; 0.1) and passes COST and OPTIMAL-P through.
+;;;;
+;;;; --------------------------------------------------------- implementation
+;;;; %MINIMIZE keeps one %SEARCH per call. Every backend call goes through one
+;;;; gate, %CALL, which adds the caller's assumptions, the (total) ORDER /
+;;;; PHASE hooks and the meter, and hands every SAT answer to %OFFER: the
+;;;; answer, projected on the variables of the CNF given and completed on the
+;;;; objective variables, becomes the incumbent when it is strictly cheaper
+;;;; (lexicographically over the levels). So the incumbent is always a model,
+;;;; whatever the strategy; a strategy only proves a level optimal.
+;;;; - Levels are normalised: per variable, w.l + w'.(not l) = min(w,w') +
+;;;;   |w-w'| on the dominant literal; costs are always computed from the
+;;;;   entries as given.
+;;;; - Strategies work on a copy of the base CNF per level (per stratum round
+;;;;   for :STRATIFIED), so their bounds never leak; a proven :LEX level is
+;;;;   hardened on the base with %ADD-PB (cardinality.lisp).
+;;;; - Hooks: the given ORDER sees only candidates of the CNF given (the
+;;;;   lowest candidate is decided when none is left) and the given PHASE only
+;;;;   its variables; the search's own auxiliaries get phase NIL. With PHASE NIL
+;;;;   the search passes its own phase: an objective variable's cheaper value,
+;;;;   else the incumbent's value, else the hint's, else T.
+;;;; - The meter steps each call's :BUDGET one decision at a time with
+;;;;   STORE-VALUE; out of limits it throws to the call's stop tag (with an
+;;;;   incumbent) or signals MINIMIZE's own SAT-BUDGET-EXCEEDED from inside the
+;;;;   handler, so CONTINUE resumes the stopped call where it stopped.
 
 (in-package #:sat-protocol)
+
+(deftype %strategy ()
+  "The MINIMIZE :STRATEGY values (0.2)."
+  '(member :linear-bdd :linear-totalizer :stratified :core-guided))
+
+;;; ------------------------------------------------------------- front end
+
+(defun %index-objective (cnf objective)
+  "OBJECTIVE (plain, or (:lex O1 ... On) with n >= 1) checked and mapped to
+integer literals of CNF (TYPE-ERROR for a bad level, entry or weight)."
+  (flet ((plain (level)
+           (check-type level list)
+           (mapcar (lambda (entry)
+                     (check-type entry cons)
+                     (let ((weight (car entry)))
+                       (check-type weight (integer 0 *))
+                       (cons weight (cnf-literal cnf (cdr entry)))))
+                   level)))
+    (if (and (consp objective) (eq (first objective) :lex))
+        (let ((levels (rest objective)))
+          (unless (and (consp levels) (%proper-list-p levels))
+            (error 'type-error :datum objective
+                               :expected-type '(cons (eql :lex) (cons list list))))
+          (cons :lex (mapcar #'plain levels)))
+        (plain objective))))
+
+(defun %hint-literal (cnf element)
+  "A HINT element as an integer literal of CNF: (name . boolean) gives the
+variable of NAME or its negation; a literal formula or a bare name goes through
+CNF-LITERAL (a non-literal formula or NIL: SAT-INVALID-FORMULA). New names
+become free user variables."
+  (if (consp element)
+      (let ((index (cnf-ensure-variable cnf (literal-name (car element)))))
+        (if (cdr element) index (- index)))
+      (cnf-literal cnf element)))
+
+(defun %minimize-front (formula objective &key assumptions backend strategy budget timeout
+                                               order phase hint)
+  "MINIMIZE with 0.2 arguments (protocol.lisp): every argument checked, then
+one BACKEND-MINIMIZE call at index level, then the complete MODEL."
+  (catch '%sat-front-value
+    (check-type strategy %strategy)
+    (check-type budget (or null (integer 0 *)))
+    (check-type timeout (or null (real 0 *)))
+    (check-type hint list)
+    (let* ((backend (%resolve-backend backend formula))
+           (cnf (%working-cnf formula))
+           ;; Allocation order: objective, assumptions, hint.
+           (ints-objective (%index-objective cnf objective))
+           (ints (%integer-literals cnf assumptions))
+           (ints-hint (mapcar (lambda (element) (%hint-literal cnf element)) hint))
+           ;; Built now: a bad :PHASE signals SAT-ERROR before any search.
+           (order-hook (and order (%order-wrapper cnf order)))
+           (phase-hook (and phase (%phase-wrapper cnf phase))))
+      (multiple-value-bind (literals cost optimal-p)
+          (backend-minimize backend cnf ints-objective
+                            :assumptions ints :strategy strategy :budget budget
+                            :timeout timeout :order order-hook :phase phase-hook
+                            :hint ints-hint)
+        (if cost
+            (values (%model cnf literals (constantly nil)) cost optimal-p)
+            (values nil nil))))))
+
+;;; ------------------------------------------------------------ the search
+
+(defstruct (%level (:constructor %make-level (entries offset softs))
+                   (:copier nil) (:predicate nil))
+  entries        ; the level as given ((w . integer-literal) ...): costs come from it
+  offset         ; what every model pays: sum over variables of min(P, N)
+  softs)         ; ((w . literal) ...): one per variable, w > 0, first-occurrence order
+
+(defstruct (%search (:constructor %make-search) (:conc-name %s-)
+                    (:copier nil) (:predicate nil))
+  backend
+  base           ; private copy of the CNF given; :LEX hardening goes here
+  n0             ; variable count of the CNF given: answers are projected on 1..N0
+  assumptions    ; the caller's integer assumptions, part of every call
+  order phase    ; total index-level hooks (PHASE never NIL)
+  levels         ; list of %LEVEL
+  completion     ; ((v . value) ...): every objective variable and its cheaper value
+  preferences    ; v -> value, for the variables whose cheaper value is strict
+  hint-table     ; v -> value of the hint (own phases)
+  metered budget timeout start (used 0) (calls 0)
+  best best-cost best-table           ; the incumbent: literals, cost list, v -> value
+  (tag (list '%stop)))                ; fresh per call: out of limits with an incumbent
+
+(defun %normalize-level (entries)
+  (let ((table (make-hash-table)) (vars '()) (offset 0) (softs '()))
+    (loop for (weight . literal) in entries
+          for v = (abs literal)
+          for cell = (or (gethash v table)
+                         (progn (push v vars) (setf (gethash v table) (cons 0 0))))
+          do (if (plusp literal) (incf (car cell) weight) (incf (cdr cell) weight)))
+    (dolist (v (nreverse vars))
+      (destructuring-bind (p . n) (gethash v table)
+        (incf offset (min p n))
+        (cond ((> p n) (push (cons (- p n) v) softs))
+              ((> n p) (push (cons (- n p) (- v)) softs)))))
+    (%make-level entries offset (nreverse softs))))
+
+(defun %lex< (a b)
+  "Lexicographic < on equal-length lists of integers."
+  (loop for x in a for y in b
+        do (cond ((< x y) (return t))
+                 ((> x y) (return nil)))
+        finally (return nil)))
+
+(defun %objective-preferences (levels)
+  "Per objective variable (first occurrence), the value whose per-level cost
+vector is lexicographically smaller; NIL on a tie (0.1's cheapest completion
+for one level). Returns (values completion-alist strict-table)."
+  (let ((vectors (make-hash-table)) (vars '()) (n (length levels)))
+    (loop for level in levels
+          for i from 0
+          do (loop for (weight . literal) in (%level-entries level)
+                   for v = (abs literal)
+                   for cell = (or (gethash v vectors)
+                                  (progn (push v vars)
+                                         (setf (gethash v vectors)
+                                               (cons (make-list n :initial-element 0)
+                                                     (make-list n :initial-element 0)))))
+                   do (incf (nth i (if (plusp literal) (car cell) (cdr cell))) weight)))
+    (let ((completion '()) (strict (make-hash-table)))
+      (dolist (v (nreverse vars))
+        (destructuring-bind (if-true . if-false) (gethash v vectors)
+          (let ((value (%lex< if-true if-false)))
+            (push (cons v value) completion)
+            (when (or value (%lex< if-false if-true))
+              (setf (gethash v strict) value)))))
+      (values (nreverse completion) strict))))
+
+(defun %terms-cost (terms table)
+  "Sum of the weights of TERMS ((w . integer-literal) ...) true under TABLE
+(v -> value; every variable of TERMS bound)."
+  (loop for (weight . literal) in terms
+        when (eq (gethash (abs literal) table) (plusp literal)) sum weight))
+
+(defun %offer (s literals)
+  "A SAT answer: project it on 1..N0, give each objective variable it leaves
+unassigned its cheaper value, and make it the incumbent when its cost list is
+strictly smaller. Returns the completed assignment (v -> value)."
+  (let ((table (make-hash-table)) (n0 (%s-n0 s)) (completed '()))
+    (dolist (l literals)
+      (when (<= (abs l) n0)
+        (setf (gethash (abs l) table) (plusp l))
+        (push l completed)))
+    (loop for (v . value) in (%s-completion s)
+          unless (nth-value 1 (gethash v table))
+            do (setf (gethash v table) value)
+               (push (if value v (- v)) completed))
+    (let ((cost (mapcar (lambda (level) (%terms-cost (%level-entries level) table))
+                        (%s-levels s))))
+      (when (or (null (%s-best-cost s)) (%lex< cost (%s-best-cost s)))
+        (setf (%s-best s) completed (%s-best-cost s) cost (%s-best-table s) table)))
+    table))
+
+;;; ------------------------------------------------------------------ hooks
+
+(defun %total-order (order n0)
+  "ORDER (index level, over the CNF given) made total over the search's own
+auxiliaries (indices > N0): it sees only the candidates <= N0; when none is
+left, the lowest candidate is decided."
+  (and order
+       (lambda (candidates)
+         (let ((given (remove-if (lambda (i) (> i n0)) candidates)))
+           (if given (funcall order given) (reduce #'min candidates))))))
+
+(defun %total-phase (phase n0)
+  (lambda (i) (and (<= i n0) (funcall phase i) t)))
+
+(defun %own-phase (s)
+  "PHASE NIL: an objective variable's strict cheaper value, else the
+incumbent's value, else the hint's, else T; the search's auxiliaries NIL."
+  (let ((n0 (%s-n0 s)))
+    (lambda (i)
+      (flet ((lookup (table)
+               (if table (gethash i table) (values nil nil))))
+        (cond ((> i n0) nil)
+              (t (multiple-value-bind (value found) (lookup (%s-preferences s))
+                   (if found
+                       value
+                       (multiple-value-bind (value found) (lookup (%s-best-table s))
+                         (if found
+                             value
+                             (multiple-value-bind (value found) (lookup (%s-hint-table s))
+                               (if found value t))))))))))))
+
+;;; ------------------------------------------------------------------ meter
+
+(defun %exhausted (s)
+  "NIL while both limits allow one more decision or call; else :BUDGET or
+:TIMEOUT."
+  (let ((budget (%s-budget s)) (timeout (%s-timeout s)))
+    (cond ((and budget (>= (%s-used s) budget)) :budget)
+          ((and timeout (>= (- (get-internal-real-time) (%s-start s))
+                            (* timeout internal-time-units-per-second)))
+           :timeout))))
+
+(defun %signal-exhausted (s which)
+  "MINIMIZE's own SAT-BUDGET-EXCEEDED (no model yet), WHICH limit ran out."
+  (let ((limit (if (eq which :budget) (%s-budget s) (%s-timeout s))))
+    (restart-case (error 'sat-budget-exceeded
+                         :budget (and (eq which :budget) limit)
+                         :timeout (and (eq which :timeout) limit))
+      (continue ()
+        :report "Double the limit that ran out and resume the search."
+        (if (eq which :budget)
+            (setf (%s-budget s) (* 2 (max limit 1)))
+            (setf (%s-timeout s) (max (* 2 limit) 1))))
+      (use-value (value)
+        :report "Stop searching; MINIMIZE returns VALUE."
+        :interactive %read-value
+        (%front-value value)))))
+
+(defun %wait-for-limits (s)
+  "Return once both limits allow one more decision or call. Out of them: with
+an incumbent, stop the search; without one, signal (CONTINUE raises the limit,
+then the limits are checked again)."
+  (loop for which = (%exhausted s)
+        while which
+        do (when (%s-best-cost s) (throw (%s-tag s) nil))
+           (%signal-exhausted s which)))
+
+(defun %call (s kind cnf extra)
+  "The gate: one BACKEND-SOLVE (KIND :SOLVE) or BACKEND-FINAL-CONFLICT (KIND
+:FINAL-CONFLICT) call on CNF under the caller's assumptions plus EXTRA, with
+the hooks and, when metered, an integer :BUDGET stepped by the meter."
+  (when (and (%s-metered s) (plusp (%s-calls s)))
+    (%wait-for-limits s))                ; every call but the first
+  (incf (%s-calls s))
+  (let ((backend (%s-backend s))
+        (assumptions (append (%s-assumptions s) extra))
+        (order (%s-order s))
+        (phase (%s-phase s)))
+    (flet ((run (budget)
+             (ecase kind
+               (:solve (backend-solve backend cnf :assumptions assumptions :order order
+                                                  :phase phase :budget budget))
+               (:final-conflict (backend-final-conflict backend cnf assumptions :budget budget
+                                                                                :order order
+                                                                                :phase phase)))))
+      (if (%s-metered s)
+          ;; Before each decision. The handler never declines: it throws,
+          ;; signals MINIMIZE's own condition (with the handlers outside this
+          ;; one, CLHS 9.1.4.1) or lets the decision go on with STORE-VALUE.
+          (handler-bind ((sat-budget-exceeded
+                           (lambda (c)
+                             (%wait-for-limits s)
+                             (incf (%s-used s))
+                             (store-value (1+ (sat-budget-exceeded-budget c)) c))))
+            (run 0))
+          (run nil)))))
+
+(defun %solve (s cnf extra)
+  "BACKEND-SOLVE through the gate: (values assignment T) for a SAT answer (the
+completed assignment, see %OFFER), else (values NIL NIL)."
+  (multiple-value-bind (literals sat) (%call s :solve cnf extra)
+    (if sat (values (%offer s literals) t) (values nil nil))))
+
+(defun %final-conflict (s cnf extra)
+  "BACKEND-FINAL-CONFLICT through the gate: (values core T), or (values NIL NIL
+assignment) for a SAT answer."
+  (multiple-value-bind (core unsat literals) (%call s :final-conflict cnf extra)
+    (if unsat (values core t) (values nil nil (%offer s literals)))))
+
+;;; ------------------------------------------------------------- strategies
+;;; Each takes a private WORK CNF and the level's normalised TERMS and returns
+;;; once the incumbent's cost on TERMS is proven least (or, in a :STRATIFIED
+;;; prefix round, once its descent ends). A cost of 0 needs no call.
+
+(defun %descend (s work terms kind)
+  "Linear SAT-UNSAT descent over TERMS from the incumbent: with R its cost on
+TERMS, add \"TERMS cost <= R-1\" and solve, until UNSAT or R = 0. KIND :BDD:
+the root of a BDD (nodes shared by the rounds; the propagating variant, see
+%BDD-BUILDER, so the bound propagates under any :ORDER) as a unit clause. KIND :GTE: a
+generalized totalizer built once, capped at the first R, tightened by a unit
+clause (-o_v) for every root output v >= R. Every completion of a SAT answer
+meets the bound, so R strictly decreases."
+  (let ((r (%terms-cost terms (%s-best-table s)))
+        (emit (lambda (clause) (cnf-add-clause work clause)))
+        (bdd nil) (outputs nil) (cut nil))
+    (loop
+      (when (zerop r) (return))
+      (ecase kind
+        (:bdd
+         (unless bdd (setf bdd (%bdd-builder work terms emit :propagating t)))
+         (let ((root (funcall bdd (1- r))))
+           (when (symbolp root) (return)) ; unreachable: 0 <= R-1 < sum of TERMS
+           (cnf-add-clause work (list root))))
+        (:gte
+         (unless outputs (setf outputs (%gte work terms r emit) cut (1+ r)))
+         (loop for (v . o) in outputs
+               when (and (>= v r) (< v cut)) do (cnf-add-clause work (list (- o))))
+         (setf cut r)))
+      (multiple-value-bind (table sat) (%solve s work '())
+        (unless sat (return))
+        (setf r (%terms-cost terms table))))))
+
+(defun %stratified (s work terms)
+  "Descents over the entries of the i largest weights, i = 1, 2, ..., each on its
+own copy of WORK (heuristic rounds that only improve the incumbent), then the
+descent over every entry, which proves the level."
+  (let ((weights (sort (remove-duplicates (mapcar #'car terms)) #'>)))
+    (dolist (w (butlast weights))
+      (%descend s (copy-cnf work) (remove-if (lambda (term) (< (car term) w)) terms) :bdd))
+    (%descend s work terms :bdd)))
+
+(defun %shrink (s work candidates)
+  "Deletion over CANDIDATES (soft assumptions; the caller's assumptions always
+stay), each test through BACKEND-FINAL-CONFLICT: a minimal sublist still
+unsatisfiable with WORK. An UNSAT answer's core also drops the remaining
+candidates outside it. With nothing else left an element is kept without a call
+(WORK under the caller's assumptions is satisfiable: the incumbent)."
+  (let ((kept '()) (rest candidates))
+    (loop while rest
+          do (let ((e (pop rest)))
+               (if (and (null kept) (null rest))
+                   (push e kept)
+                   (multiple-value-bind (core unsat)
+                       (%final-conflict s work (append (reverse kept) rest))
+                     (if unsat
+                         (setf rest (remove-if-not (lambda (x) (member x core)) rest))
+                         (push e kept))))))
+    (nreverse kept)))
+
+(defun %core-guided (s work terms)
+  "OLL: LOWER starts at 0 (the cost on TERMS of every model is LOWER plus the
+weights left on the true exposed softs plus hidden totalizer outputs, all >= 0).
+Assume every exposed soft with weight left false. SAT: that answer costs LOWER,
+optimal. UNSAT: shrink the core, LOWER += its least weight W, take W off each of
+its softs, and relax it with a unit totalizer whose output \">= 2\" becomes a
+soft of weight W (an exposed output \">= j\" in a core exposes \">= j+1\"). Ends
+when LOWER reaches the incumbent's cost; LOWER grows by >= 1 per core."
+  (let ((weight (make-hash-table))      ; soft literal -> weight left
+        (next (make-hash-table))        ; exposed output -> (later outputs . totalizer weight)
+        (live '())                      ; soft literals, newest first
+        (lower 0))
+    (flet ((expose (literal w)
+             (unless (nth-value 1 (gethash literal weight)) (push literal live))
+             (incf (gethash literal weight 0) w))
+           (goal () (%terms-cost terms (%s-best-table s))))
+      (loop for (w . l) in terms do (expose l w))
+      (loop
+        (when (>= lower (goal)) (return))
+        (let ((assume (loop for l in (reverse live)
+                            when (plusp (gethash l weight)) collect (- l))))
+          (multiple-value-bind (core unsat) (%final-conflict s work assume)
+            (unless unsat (return))
+            (let* ((softs (mapcar #'- (%shrink s work (remove-if-not (lambda (a) (member a core))
+                                                                     assume))))
+                   (w-min (loop for l in softs minimize (gethash l weight))))
+              (unless softs
+                (error 'sat-error :message "final conflict without a soft literal under a satisfiable CNF"))
+              (incf lower w-min)
+              (dolist (l softs)
+                (decf (gethash l weight) w-min)
+                (let ((later (gethash l next)))
+                  (when later
+                    (remhash l next)
+                    (destructuring-bind (outputs . w-total) later
+                      (when outputs
+                        (expose (first outputs) w-total)
+                        (setf (gethash (first outputs) next) (cons (rest outputs) w-total)))))))
+              (when (and (rest softs) (< lower (goal)))
+                ;; o_1 holds in every model (SOFTS is a core); o_2 is the new soft.
+                (let ((outputs (mapcar #'cdr (%gte work (mapcar (lambda (l) (cons 1 l)) softs)
+                                                   (length softs)
+                                                   (lambda (clause) (cnf-add-clause work clause))))))
+                  (expose (second outputs) w-min)
+                  (setf (gethash (second outputs) next) (cons (cddr outputs) w-min)))))))))))
+
+;;; ----------------------------------------------------------------- driver
+
+(defun %first-models (s hint)
+  "The first call: BACKEND-SOLVE on the CNF as given under the assumptions plus
+HINT; when that fails with a HINT, once more under the assumptions alone (that
+call is metered like any other). True when a model was found."
+  (or (nth-value 1 (%solve s (%s-base s) hint))
+      (and hint (nth-value 1 (%solve s (%s-base s) '())))))
+
+(defun %prove-level (s level strategy)
+  (let ((work (copy-cnf (%s-base s)))
+        (terms (%level-softs level)))
+    (ecase strategy
+      (:linear-bdd (%descend s work terms :bdd))
+      (:linear-totalizer (%descend s work terms :gte))
+      (:stratified (%stratified s work terms))
+      (:core-guided (%core-guided s work terms)))))
+
+(defun %harden (s level)
+  "A proven level becomes hard: its cost on the normalised terms stays at the
+incumbent's (no big-M weights)."
+  (let ((terms (%level-softs level)))
+    (%add-pb (%s-base s) terms (%terms-cost terms (%s-best-table s)) :auto nil)))
 
 (defun %minimize (backend cnf objective &key assumptions strategy budget timeout
                                               order phase hint)
   "Default method of BACKEND-MINIMIZE for every 0.2 argument (see this file's
 header): STRATEGY on BACKEND-SOLVE / BACKEND-FINAL-CONFLICT, the BUDGET /
 TIMEOUT meter, HINT, and :LEX objectives."
-  (declare (ignore backend cnf objective assumptions strategy budget timeout
-                   order phase hint))
-  (%l2b1-pending '%minimize))
+  (check-type strategy %strategy)
+  (check-type budget (or null (integer 0 *)))
+  (check-type timeout (or null (real 0 *)))
+  (let* ((lex (and (consp objective) (eq (first objective) :lex)))
+         (n0 (cnf-variable-count cnf))
+         (levels (mapcar #'%normalize-level (if lex (rest objective) (list objective))))
+         (s (%make-search :backend backend :base (copy-cnf cnf) :n0 n0
+                          :assumptions assumptions :order (%total-order order n0)
+                          :levels levels :hint-table (%assignment hint)
+                          :metered (and (or budget timeout) t) :budget budget :timeout timeout
+                          :start (get-internal-real-time))))
+    (multiple-value-bind (completion preferences) (%objective-preferences levels)
+      (setf (%s-completion s) completion
+            (%s-preferences s) preferences))
+    (setf (%s-phase s) (if phase (%total-phase phase n0) (%own-phase s)))
+    (let ((proven (catch (%s-tag s)
+                    (unless (%first-models s hint)
+                      (return-from %minimize (values nil nil)))
+                    (loop for (level . more) on levels
+                          do (%prove-level s level strategy)
+                             (when more (%harden s level)))
+                    t)))
+      (values (copy-list (%s-best s))
+              (if lex (copy-list (%s-best-cost s)) (first (%s-best-cost s)))
+              proven))))

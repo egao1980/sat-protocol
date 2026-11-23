@@ -273,7 +273,11 @@ operand is checked before any folding."
                  (:or (and (some #'ev args) t))
                  (:implies (or (not (ev (first args))) (ev (second args))))
                  (:iff (eq (ev (first args)) (ev (second args))))
-                 (:at-most (%l2b1-pending 'formula-eval))))))
+                 ;; Every operand is evaluated (an unbound one signals as usual).
+                 (:at-most (<= (loop for weight in (formula-weights f)
+                                     for operand in args
+                                     when (ev operand) sum weight)
+                               (formula-bound f)))))))
     (ev (%check-formula formula))))
 
 (defun formula-assign (formula name value)
@@ -289,7 +293,9 @@ operand is checked before any folding."
                  (:or (sat-or* (mapcar #'walk args)))
                  (:implies (sat-implies (walk (first args)) (walk (second args))))
                  (:iff (sat-iff (walk (first args)) (walk (second args))))
-                 (:at-most (%l2b1-pending 'formula-assign))))))
+                 (:at-most (sat-pb-at-most (mapcar #'cons (formula-weights f) (mapcar #'walk args))
+                                           (formula-bound f)
+                                           :encoding (formula-encoding f)))))))
     (walk (%check-formula formula))))
 
 (defun %bare-name-p (name)
@@ -306,7 +312,12 @@ operand is checked before any folding."
               (if (%bare-name-p name) name (list :var name))))
       ((:not :and :or :implies :iff)
        (cons (formula-operator f) (mapcar #'formula->sexp (formula-operands f))))
-      (:at-most (%l2b1-pending 'formula->sexp)))))
+      (:at-most
+       (let ((weights (formula-weights f))
+             (operands (mapcar #'formula->sexp (formula-operands f))))
+         (if (every (lambda (w) (eql w 1)) weights)
+             (list* :at-most (formula-bound f) operands)
+             (list* :pb-at-most (formula-bound f) (mapcar #'list weights operands))))))))
 
 (defun %proper-list-p (object)
   "True for a finite, NIL-terminated list (tortoise and hare)."
@@ -317,6 +328,19 @@ operand is checked before any folding."
       (cond ((null fast) (return t)) ((atom fast) (return nil)))
       (setf fast (cdr fast) slow (cdr slow))
       (when (eq fast slow) (return nil)))))
+
+(defun %literal-sexp-p (sexp)
+  "0.2: an operand of (:at-most ...) / (:pb-at-most ...): NAME, (:var NAME),
+(:not NAME), (:not (:var NAME)), :true or :false. A bare NAME is an atom other
+than NIL, :TRUE and :FALSE; (:var NAME) takes any non-NIL name."
+  (flet ((name-p (s) (and s (atom s) (not (member s '(:true :false)))))
+         (var-p (s) (and (consp s) (%proper-list-p s) (eq (first s) :var)
+                         (= 2 (length s)) (second s) t)))
+    (or (member sexp '(:true :false))
+        (name-p sexp)
+        (var-p sexp)
+        (and (consp sexp) (%proper-list-p sexp) (eq (first sexp) :not) (= 2 (length sexp))
+             (or (name-p (second sexp)) (var-p (second sexp)))))))
 
 (defun sexp->formula (sexp)
   (flet ((bad (why)
@@ -348,5 +372,27 @@ operand is checked before any folding."
                            (sat-implies (sexp->formula (first args)) (sexp->formula (second args))))
                  (:iff (arity 2)
                        (sat-iff (sexp->formula (first args)) (sexp->formula (second args))))
-                 ((:at-most :pb-at-most) (%l2b1-pending 'sexp->formula))
+                 ;; 0.2: every part is checked here, before any constructor runs,
+                 ;; so a malformed constraint signals SAT-INVALID-FORMULA (with
+                 ;; USE-VALUE at this node), never TYPE-ERROR.
+                 ((:at-most :pb-at-most)
+                  (unless (and args (integerp (first args)))
+                    (bad (format nil "~S needs an integer bound" (first sexp))))
+                  (let ((k (first args)) (operands (rest args)))
+                    (if (eq (first sexp) :at-most)
+                        (progn
+                          (dolist (s operands)
+                            (unless (%literal-sexp-p s)
+                              (bad "an :at-most operand must be a literal sexp")))
+                          (sat-at-most-k (mapcar #'sexp->formula operands) k))
+                        (progn
+                          (dolist (term operands)
+                            (unless (and (consp term) (%proper-list-p term) (= 2 (length term))
+                                         (typep (first term) '(integer 0 *))
+                                         (%literal-sexp-p (second term)))
+                              (bad "a :pb-at-most term must be (WEIGHT LITERAL), WEIGHT >= 0")))
+                          (sat-pb-at-most (mapcar (lambda (term)
+                                                    (cons (first term) (sexp->formula (second term))))
+                                                  operands)
+                                          k)))))
                  (t (bad "unknown operator")))))))))

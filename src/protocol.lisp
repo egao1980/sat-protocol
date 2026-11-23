@@ -286,8 +286,15 @@ UNSAT answer with a cheap core (a sublist of ASSUMPTIONS, not necessarily
 minimal). Default method: one BACKEND-SOLVE call; UNSAT -> all of ASSUMPTIONS.
 See the header of protocol.lisp.")
   (:method ((backend sat-backend) cnf assumptions &key budget order phase)
-    (declare (ignore cnf assumptions budget order phase))
-    (%l2b1-pending 'backend-final-conflict)))
+    ;; One search; without conflict analysis the only core it can name is
+    ;; every assumption (a fresh copy, duplicates kept). A budget signal of
+    ;; the search reaches the caller.
+    (multiple-value-bind (literals sat)
+        (backend-solve backend cnf :assumptions assumptions :budget budget
+                                   :order order :phase phase)
+      (if sat
+          (values nil nil literals)
+          (values (copy-list assumptions) t)))))
 
 ;;; ------------------------------------------------------------ front ends
 
@@ -402,7 +409,10 @@ when FILL is a function, else left out."
   ;; 0.2 arguments: minimize.lisp. The 0.1 path below is GIVEN.
   (when (or (not (eq strategy :linear-bdd)) budget timeout order phase hint
             (and (consp objective) (eq (first objective) :lex)))
-    (return-from minimize (%l2b1-pending 'minimize)))
+    (return-from minimize
+      (%minimize-front formula objective
+                       :assumptions assumptions :backend backend :strategy strategy
+                       :budget budget :timeout timeout :order order :phase phase :hint hint)))
   (catch '%sat-front-value
     (let* ((backend (%resolve-backend backend formula))
            (cnf (%working-cnf formula))
