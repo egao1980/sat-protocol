@@ -14,8 +14,20 @@
 ;;;;                        end returns (values VALUE NIL).
 ;;;; SAT-BUDGET-EXCEEDED    A backend made more decisions than :BUDGET. Signalled by
 ;;;;                        SIGNAL-BUDGET-EXCEEDED (backends call it). CONTINUE:
-;;;;                        double the budget and keep searching. USE-VALUE (value):
-;;;;                        the front end returns (values VALUE NIL).
+;;;;                        double the budget and keep searching. STORE-VALUE
+;;;;                        (budget), 0.2: keep searching with that budget (a
+;;;;                        non-negative integer: the most decisions of the whole
+;;;;                        call; the backend signals again before the decision that
+;;;;                        would exceed it). USE-VALUE (value): the front end
+;;;;                        returns (values VALUE NIL).
+;;;;                        0.2: MINIMIZE also signals it when its :BUDGET or
+;;;;                        :TIMEOUT runs out before any model was found (see
+;;;;                        minimize.lisp). Then exactly one of BUDGET (decisions)
+;;;;                        and TIMEOUT (seconds) is non-NIL: the limit that ran out.
+;;;;                        CONTINUE doubles that limit (a budget as
+;;;;                        SIGNAL-BUDGET-EXCEEDED does; a timeout T becomes
+;;;;                        (max (* 2 T) 1)); USE-VALUE: MINIMIZE returns
+;;;;                        (values VALUE NIL).
 ;;;; SAT-DIMACS-ERROR       READ-DIMACS met a malformed line. SKIP-LINE: ignore the
 ;;;;                        line. CONTINUE (header count mismatches only): accept
 ;;;;                        the actual counts.
@@ -51,11 +63,17 @@
   (:documentation "A front end found no backend for FORMULA."))
 
 (define-condition sat-budget-exceeded (sat-error)
-  ((budget :initarg :budget :reader sat-budget-exceeded-budget))
+  ((budget :initarg :budget :reader sat-budget-exceeded-budget :initform nil)
+   (timeout :initarg :timeout :reader sat-budget-exceeded-timeout :initform nil
+            :documentation "0.2: MINIMIZE's :TIMEOUT (seconds) when that is what ran out."))
   (:report (lambda (c s)
-             (format s "SAT search exceeded its budget of ~D decision~:P"
-                     (sat-budget-exceeded-budget c))))
-  (:documentation "A backend made more decisions than the :BUDGET of the call."))
+             (if (sat-budget-exceeded-timeout c)
+                 (format s "SAT search exceeded its timeout of ~A second~:P"
+                         (sat-budget-exceeded-timeout c))
+                 (format s "SAT search exceeded its budget of ~D decision~:P"
+                         (sat-budget-exceeded-budget c)))))
+  (:documentation "A backend made more decisions than the :BUDGET of the call, or
+(0.2) MINIMIZE ran out of :BUDGET or :TIMEOUT before finding any model."))
 
 (define-condition sat-dimacs-error (sat-error)
   ((line :initarg :line :reader sat-dimacs-error-line :initform nil)
@@ -90,14 +108,26 @@
 (defun %front-value (value)
   (throw '%sat-front-value (values value nil)))
 
+(defun %read-budget ()
+  (format *query-io* "New budget (decisions): ")
+  (force-output *query-io*)
+  (list (read *query-io*)))
+
 (defun signal-budget-exceeded (budget)
   "For backends: call when the search has made more than BUDGET decisions.
 Signals SAT-BUDGET-EXCEEDED. Returns the new budget (2 x BUDGET, at least 1)
-when the handler invokes CONTINUE; USE-VALUE makes the front end return."
+when the handler invokes CONTINUE, or the value given to STORE-VALUE (0.2: a
+non-negative integer, the new budget of the whole call); USE-VALUE makes the
+front end return."
   (restart-case (error 'sat-budget-exceeded :budget budget)
     (continue ()
       :report "Double the budget and keep searching."
       (* 2 (max budget 1)))
+    (store-value (new-budget)
+      :report "Keep searching with another budget."
+      :interactive %read-budget
+      (check-type new-budget (integer 0 *))
+      new-budget)
     (use-value (value)
       :report "Stop searching; the call returns VALUE."
       (%front-value value))))

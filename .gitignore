@@ -8,3 +8,4 @@ cl-repo.lock
 *.dx64fsl
 *.lx64fsl
 *.wx64fsl
+.team-solve/

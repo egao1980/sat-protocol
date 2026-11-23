@@ -43,7 +43,22 @@
 ;;;;   encoded with Tseitin (or Plaisted-Greenbaum) auxiliaries: the result is
 ;;;;   equisatisfiable, its models projected on the user variables are exactly
 ;;;;   the models of FORMULA, and the number of auxiliaries is at most the number
-;;;;   of operator nodes of FORMULA.
+;;;;   of operator nodes of FORMULA, not counting :AT-MOST nodes and their
+;;;;   encodings (0.2).
+;;;;
+;;;;   :AT-MOST nodes (0.2; the encodings are specified in cardinality.lisp):
+;;;;   - a top-level :AT-MOST conjunct adds exactly the clauses (and fresh
+;;;;     auxiliaries) of its FORMULA-ENCODING, as CNF-ADD-PB-AT-MOST would, over
+;;;;     the integer literals of its operands. A :PAIRWISE node adds no
+;;;;     auxiliary; the others add at most n * (K + 1) (n operands, bound K).
+;;;;   - a nested :AT-MOST node (under :NOT, :OR, :IMPLIES, :IFF, or inside an
+;;;;     :AND that is itself nested) is reified: a fresh auxiliary X with
+;;;;     "X -> constraint" when it occurs positively and "constraint -> X" when
+;;;;     it occurs negatively (the complement: sum of w_i [not L_i] <= W - K - 1,
+;;;;     W the sum of the weights, in the same encoding). The projection
+;;;;     guarantee above holds for every formula.
+;;;;   - inside UNSAT-CORE's :NAMED formulas (the GUARD of %ADD-FORMULA) every
+;;;;     clause the constraint needs for the guard to imply it carries -GUARD.
 
 (in-package #:sat-protocol)
 
@@ -169,8 +184,9 @@
 (defun %pg (cnf f pos neg)
   "Plaisted-Greenbaum: an integer literal X for F, with clauses X -> F when POS
 and F -> X when NEG. One auxiliary per :AND/:OR/:IMPLIES/:IFF node, none for
-:NOT or :VAR. Children are encoded before their parent's auxiliary is
-allocated (post-order), so definitions are complete below each auxiliary."
+:NOT or :VAR; an :AT-MOST node (0.2) is reified by %PG-AT-MOST. Children are
+encoded before their parent's auxiliary is allocated (post-order), so
+definitions are complete below each auxiliary."
   (let ((args (formula-operands f)))
     (ecase (formula-operator f)
       (:var (cnf-ensure-variable cnf (%formula-name f)))
@@ -205,7 +221,8 @@ allocated (post-order), so definitions are complete below each auxiliary."
          (when neg
            (cnf-add-clause cnf (list x lp lq))
            (cnf-add-clause cnf (list x (- lp) (- lq))))
-         x)))))
+         x))
+      (:at-most (%pg-at-most cnf f pos neg)))))
 
 (defun %add-formula (cnf formula &optional guard)
   (dolist (name (formula-variables formula))
@@ -218,6 +235,9 @@ allocated (post-order), so definitions are complete below each auxiliary."
       (case (formula-operator c)
         (:true)
         (:false (emit '()))
+        ;; 0.2: the node's own encoding, guarded like the other clauses
+        ;; (cardinality.lisp).
+        (:at-most (%encode-at-most cnf c guard))
         (t (let ((shape (%clause-shape cnf c)))
              (cond ((not (eq shape :none)) (emit shape))
                    ;; A top-level :OR needs no auxiliary of its own.

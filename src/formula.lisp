@@ -4,9 +4,23 @@
 ;;;; Variables are named by any object other than NIL, compared with EQUAL
 ;;;; (strings, integers, symbols, keywords, lists). Formulas are immutable.
 ;;;;
-;;;; FORMULA-OPERATOR is one of :TRUE :FALSE :VAR :NOT :AND :OR :IMPLIES :IFF.
+;;;; FORMULA-OPERATOR is one of :TRUE :FALSE :VAR :NOT :AND :OR :IMPLIES :IFF,
+;;;; and (0.2) :AT-MOST.
 ;;;; FORMULA-OPERANDS: NIL for constants and variables, (F) for :NOT, the
-;;;; children for :AND / :OR (two or more), (P Q) for :IMPLIES / :IFF.
+;;;; children for :AND / :OR (two or more), (P Q) for :IMPLIES / :IFF, the
+;;;; literal formulas for :AT-MOST (one or more, given order, duplicates kept).
+;;;;
+;;;; :AT-MOST (0.2, GIVEN shape; built only by the constructors in
+;;;; cardinality.lisp) is the linear constraint
+;;;;     sum of w_i over the operands L_i that are true  <=  K
+;;;; FORMULA-WEIGHTS: the positive integers w_i, parallel to FORMULA-OPERANDS
+;;;; (all 1 for a cardinality constraint). FORMULA-BOUND: K, an integer with
+;;;; 1 <= K < sum of the weights (the constructors fold every other case).
+;;;; FORMULA-ENCODING: how TO-CNF encodes it, one of :PAIRWISE :SEQUENTIAL
+;;;; :TOTALIZER :BDD (never :AUTO: the constructor resolves it). The three
+;;;; readers return NIL for every other operator. The encoding never changes
+;;;; the formula's meaning: FORMULA-EVAL, FORMULA-VARIABLES, FORMULA-ASSIGN and
+;;;; the sexp ignore it.
 ;;;;
 ;;;; Constructors fold constants (exact rules; the tests check them):
 ;;;;   (sat-true) (sat-false)       the two constants (each call may return the
@@ -40,13 +54,26 @@
 ;;;; name -> (values value bound-p). An unbound variable takes DEFAULT when
 ;;;; :DEFAULT is supplied, else signals SAT-UNBOUND-VARIABLE with USE-VALUE.
 ;;;;
+;;;; :AT-MOST (0.2): true when the weights of its true operands sum to at most
+;;;; FORMULA-BOUND.
+;;;;
 ;;;; FORMULA-ASSIGN formula name value: substitute the constant VALUE (boolean)
 ;;;; for every occurrence of NAME, rebuilding through the folding constructors
-;;;; (cl-repository's SAT-REPLACE).
+;;;; (cl-repository's SAT-REPLACE). An :AT-MOST node is rebuilt with
+;;;; SAT-PB-AT-MOST over its (weight . operand) terms, its bound and its
+;;;; encoding, so a substituted operand folds by the rules in cardinality.lisp.
 ;;;;
 ;;;; Sexp syntax (FORMULA->SEXP / SEXP->FORMULA), for fixtures and printing:
 ;;;;   :true :false | (:var NAME) | (:not S) | (:and S...) | (:or S...)
 ;;;;   | (:implies P Q) | (:iff P Q) | NAME
+;;;;   | (:at-most K S...)               (0.2) SAT-AT-MOST-K over the S
+;;;;   | (:pb-at-most K (W S)...)        (0.2) SAT-PB-AT-MOST over ((W . S)...)
+;;;; FORMULA->SEXP writes an :AT-MOST node as (:at-most K S...) when every
+;;;; weight is 1, else as (:pb-at-most K (W S)...); the encoding is not written
+;;;; (SEXP->FORMULA uses :AUTO). SEXP->FORMULA: K must be an integer, each W a
+;;;; non-negative integer and each S a literal sexp (NAME, (:var NAME),
+;;;; (:not NAME), (:not (:var NAME))) or :true / :false; anything else is a
+;;;; malformed sexp (SAT-INVALID-FORMULA with USE-VALUE, as below).
 ;;;; A bare NAME is any atom other than NIL, :TRUE and :FALSE (strings,
 ;;;; integers, symbols, other keywords). FORMULA->SEXP writes a bare name for
 ;;;; strings, integers and non-keyword symbols other than T, and (:var NAME)
@@ -60,11 +87,18 @@
 
 (defclass formula ()
   ((operator :initarg :operator :reader formula-operator
-             :type (member :true :false :var :not :and :or :implies :iff))
+             :type (member :true :false :var :not :and :or :implies :iff :at-most))
    (operands :initarg :operands :reader formula-operands :initform nil :type list)
-   (name :initarg :name :initform nil :reader %formula-name))
+   (name :initarg :name :initform nil :reader %formula-name)
+   ;; 0.2, :AT-MOST only (NIL otherwise).
+   (bound :initarg :bound :initform nil :reader formula-bound
+          :documentation ":AT-MOST: the integer K.")
+   (weights :initarg :weights :initform nil :reader formula-weights
+            :documentation ":AT-MOST: positive integers parallel to the operands.")
+   (encoding :initarg :encoding :initform nil :reader formula-encoding
+             :documentation ":AT-MOST: :PAIRWISE, :SEQUENTIAL, :TOTALIZER or :BDD."))
   (:documentation "An immutable propositional formula. Build it with the
-constructors (SAT-VAR, SAT-AND, ...), never with MAKE-INSTANCE."))
+constructors (SAT-VAR, SAT-AND, ..., SAT-PB-AT-MOST), never with MAKE-INSTANCE."))
 
 (defun formula-p (object)
   (typep object 'formula))
@@ -79,6 +113,12 @@ constructors (SAT-VAR, SAT-AND, ...), never with MAKE-INSTANCE."))
 
 (defun %make-formula (operator operands)
   (make-instance 'formula :operator operator :operands operands))
+
+(defun %make-at-most (operands weights bound encoding)
+  "0.2, GIVEN: the raw :AT-MOST node (no checks, no folding). The constructors
+in cardinality.lisp call it once they have folded and resolved ENCODING."
+  (make-instance 'formula :operator :at-most :operands operands
+                          :weights weights :bound bound :encoding encoding))
 
 (defvar *%true* (make-instance 'formula :operator :true))
 (defvar *%false* (make-instance 'formula :operator :false))
@@ -232,7 +272,12 @@ operand is checked before any folding."
                  (:and (every #'ev args))
                  (:or (and (some #'ev args) t))
                  (:implies (or (not (ev (first args))) (ev (second args))))
-                 (:iff (eq (ev (first args)) (ev (second args))))))))
+                 (:iff (eq (ev (first args)) (ev (second args))))
+                 ;; Every operand is evaluated (an unbound one signals as usual).
+                 (:at-most (<= (loop for weight in (formula-weights f)
+                                     for operand in args
+                                     when (ev operand) sum weight)
+                               (formula-bound f)))))))
     (ev (%check-formula formula))))
 
 (defun formula-assign (formula name value)
@@ -247,7 +292,10 @@ operand is checked before any folding."
                  (:and (sat-and* (mapcar #'walk args)))
                  (:or (sat-or* (mapcar #'walk args)))
                  (:implies (sat-implies (walk (first args)) (walk (second args))))
-                 (:iff (sat-iff (walk (first args)) (walk (second args))))))))
+                 (:iff (sat-iff (walk (first args)) (walk (second args))))
+                 (:at-most (sat-pb-at-most (mapcar #'cons (formula-weights f) (mapcar #'walk args))
+                                           (formula-bound f)
+                                           :encoding (formula-encoding f)))))))
     (walk (%check-formula formula))))
 
 (defun %bare-name-p (name)
@@ -263,7 +311,13 @@ operand is checked before any folding."
       (:var (let ((name (%formula-name f)))
               (if (%bare-name-p name) name (list :var name))))
       ((:not :and :or :implies :iff)
-       (cons (formula-operator f) (mapcar #'formula->sexp (formula-operands f)))))))
+       (cons (formula-operator f) (mapcar #'formula->sexp (formula-operands f))))
+      (:at-most
+       (let ((weights (formula-weights f))
+             (operands (mapcar #'formula->sexp (formula-operands f))))
+         (if (every (lambda (w) (eql w 1)) weights)
+             (list* :at-most (formula-bound f) operands)
+             (list* :pb-at-most (formula-bound f) (mapcar #'list weights operands))))))))
 
 (defun %proper-list-p (object)
   "True for a finite, NIL-terminated list (tortoise and hare)."
@@ -274,6 +328,19 @@ operand is checked before any folding."
       (cond ((null fast) (return t)) ((atom fast) (return nil)))
       (setf fast (cdr fast) slow (cdr slow))
       (when (eq fast slow) (return nil)))))
+
+(defun %literal-sexp-p (sexp)
+  "0.2: an operand of (:at-most ...) / (:pb-at-most ...): NAME, (:var NAME),
+(:not NAME), (:not (:var NAME)), :true or :false. A bare NAME is an atom other
+than NIL, :TRUE and :FALSE; (:var NAME) takes any non-NIL name."
+  (flet ((name-p (s) (and s (atom s) (not (member s '(:true :false)))))
+         (var-p (s) (and (consp s) (%proper-list-p s) (eq (first s) :var)
+                         (= 2 (length s)) (second s) t)))
+    (or (member sexp '(:true :false))
+        (name-p sexp)
+        (var-p sexp)
+        (and (consp sexp) (%proper-list-p sexp) (eq (first sexp) :not) (= 2 (length sexp))
+             (or (name-p (second sexp)) (var-p (second sexp)))))))
 
 (defun sexp->formula (sexp)
   (flet ((bad (why)
@@ -302,7 +369,30 @@ operand is checked before any folding."
                  (:and (sat-and* (mapcar #'sexp->formula args)))
                  (:or (sat-or* (mapcar #'sexp->formula args)))
                  (:implies (arity 2)
-                  (sat-implies (sexp->formula (first args)) (sexp->formula (second args))))
+                           (sat-implies (sexp->formula (first args)) (sexp->formula (second args))))
                  (:iff (arity 2)
-                  (sat-iff (sexp->formula (first args)) (sexp->formula (second args))))
+                       (sat-iff (sexp->formula (first args)) (sexp->formula (second args))))
+                 ;; 0.2: every part is checked here, before any constructor runs,
+                 ;; so a malformed constraint signals SAT-INVALID-FORMULA (with
+                 ;; USE-VALUE at this node), never TYPE-ERROR.
+                 ((:at-most :pb-at-most)
+                  (unless (and args (integerp (first args)))
+                    (bad (format nil "~S needs an integer bound" (first sexp))))
+                  (let ((k (first args)) (operands (rest args)))
+                    (if (eq (first sexp) :at-most)
+                        (progn
+                          (dolist (s operands)
+                            (unless (%literal-sexp-p s)
+                              (bad "an :at-most operand must be a literal sexp")))
+                          (sat-at-most-k (mapcar #'sexp->formula operands) k))
+                        (progn
+                          (dolist (term operands)
+                            (unless (and (consp term) (%proper-list-p term) (= 2 (length term))
+                                         (typep (first term) '(integer 0 *))
+                                         (%literal-sexp-p (second term)))
+                              (bad "a :pb-at-most term must be (WEIGHT LITERAL), WEIGHT >= 0")))
+                          (sat-pb-at-most (mapcar (lambda (term)
+                                                    (cons (first term) (sexp->formula (second term))))
+                                                  operands)
+                                          k)))))
                  (t (bad "unknown operator")))))))))
