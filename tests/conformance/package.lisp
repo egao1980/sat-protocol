@@ -8,12 +8,18 @@
 ;;;;
 ;;;; Everything in this directory is GIVEN test code (no stubs), including the
 ;;;; REFERENCE-BACKEND oracle (cl-repository's naive search over CNF).
+;;;;
+;;;; 0.2 (L2b-1) adds optimum.lisp (brute-force and DP oracles, the weighted
+;;;; chain family) and the tests strategy-test, lex-test, minimize-budget-test,
+;;;; chain-test and final-conflict-test. Instances are sized for a DPLL backend
+;;;; (each optimum is proven in milliseconds by the 0.1 linear descent).
 
 (defpackage #:sat-protocol/conformance
   (:use #:cl #:rove #:sat-protocol)
   (:export
    #:run-conformance
    #:reference-backend
+   #:reference-backend-propagate         ; 0.2
    #:reference-search
    ;; helpers shared with backend test suites
    #:make-rng
@@ -36,7 +42,34 @@
    #:random-sexp
    #:sexp-eval
    #:sexp-vars
-   #:all-assignments))
+   #:all-assignments
+   ;; 0.2 optimisation oracles (optimum.lisp)
+   #:*strategies*
+   #:lit-formula
+   #:int-objective->literals
+   #:int-cost
+   #:random-int-objective
+   #:brute-optimum
+   #:lex<
+   #:brute-lex-optimum
+   #:name-cost
+   #:random-name-objective
+   #:sexp-optimum
+   #:random-chain
+   #:random-chains
+   #:chain-levels
+   #:chain-x
+   #:chain-y
+   #:chain-formula
+   #:chain-objective
+   #:chain-lex-objective
+   #:chain-dp
+   #:chain-brute
+   #:chain-labellings
+   #:chain-labelling-cost
+   #:chain-model
+   #:chain-model-labelling
+   #:chain-worst-labelling))
 
 (in-package #:sat-protocol/conformance)
 

@@ -33,15 +33,38 @@
 ;;;;   -> a function of no arguments returning (values LITERALS T) per projected
 ;;;;   model, then (values NIL NIL). PROJECT: list of indices; LITERALS assign
 ;;;;   exactly those indices; each distinct projected model comes exactly once.
-;;;; (backend-minimize backend cnf objective &key assumptions)
-;;;;   OBJECTIVE: list of (weight . integer-literal). -> (values LITERALS COST)
-;;;;   for a model of least COST (sum of the weights of its true literals), or
-;;;;   (values NIL NIL) when unsatisfiable.
+;;;; (backend-minimize backend cnf objective &key assumptions strategy budget
+;;;;                   timeout order phase hint)                    ; 0.2 keys
+;;;;   OBJECTIVE: list of (weight . integer-literal), or (0.2) (:lex O1 ... On)
+;;;;   of such lists. -> (values LITERALS COST OPTIMAL-P) for a model of least
+;;;;   COST (sum of the weights of its true literals; a list of per-level costs
+;;;;   for :lex), or (values NIL NIL) when unsatisfiable. OPTIMAL-P (0.2) is NIL
+;;;;   when BUDGET / TIMEOUT stopped the search first. ORDER / PHASE are index
+;;;;   level (as BACKEND-SOLVE), HINT is a list of integer literals; STRATEGY,
+;;;;   BUDGET, TIMEOUT: see minimize.lisp, which specifies the default method
+;;;;   (%MINIMIZE). The front end has checked every argument. With the 0.1
+;;;;   arguments only (STRATEGY :LINEAR-BDD, the rest NIL, a plain objective) the
+;;;;   default method is the 0.1 linear descent and returns OPTIMAL-P T.
+;;;;   0.2 adds keys to the GF lambda list: a 0.1 method that accepts only
+;;;;   :ASSUMPTIONS is no longer congruent (CLHS 7.6.4); no published backend
+;;;;   specialises BACKEND-MINIMIZE.
 ;;;; (backend-unsat-core backend cnf assumptions)
 ;;;;   -> (values CORE T) with CORE a subset of the integer literals ASSUMPTIONS
 ;;;;   (kept in their given order) such that CNF plus CORE is unsatisfiable and
 ;;;;   removing any one element of CORE makes it satisfiable; or (values NIL NIL)
 ;;;;   when CNF plus ASSUMPTIONS is satisfiable.
+;;;; (backend-final-conflict backend cnf assumptions &key budget order phase)
+;;;;                                                                    ; 0.2
+;;;;   BACKEND-SOLVE under ASSUMPTIONS, explaining UNSAT with a cheap core.
+;;;;   UNSAT -> (values CORE T), CORE a sublist of the integer literals
+;;;;   ASSUMPTIONS (given order) such that CNF plus CORE is unsatisfiable (any
+;;;;   sublist when CNF alone is), not necessarily minimal. Satisfiable ->
+;;;;   (values NIL NIL LITERALS), LITERALS as BACKEND-SOLVE returns them. CNF is
+;;;;   not modified. BUDGET, ORDER, PHASE as for BACKEND-SOLVE. Default method:
+;;;;   one BACKEND-SOLVE call with these arguments; UNSAT -> a fresh copy of
+;;;;   ASSUMPTIONS (all of them). A backend with assumption-based conflict
+;;;;   analysis (CDCL) returns the final conflict of that call instead.
+;;;;   :CORE-GUIDED and UNSAT-CORE :MINIMAL NIL use it.
 ;;;;
 ;;;; -------------------------------------------------------------- front ends
 ;;;; FORMULA is a FORMULA or a CNF (never modified). Literals are literal
@@ -75,19 +98,29 @@
 ;;;;   many models. SAT-NO-BACKEND is signalled by SOLVE-ALL itself (USE-VALUE:
 ;;;;   SOLVE-ALL returns the value).
 ;;;;
-;;;; (minimize formula objective &key assumptions backend) -> (values MODEL COST)
+;;;; (minimize formula objective &key assumptions backend strategy budget
+;;;;           timeout order phase hint) -> (values MODEL COST OPTIMAL-P)
 ;;;;   OBJECTIVE: list of (weight . literal), weights non-negative integers (else
 ;;;;   TYPE-ERROR). MODEL is complete and of least COST = sum of weights of its
 ;;;;   true objective literals. Unsatisfiable -> (values NIL NIL). This is the
 ;;;;   weighted-preference API: "prefer x" is (1 . (sat-not x)).
+;;;;   0.2: the third value OPTIMAL-P, the keys STRATEGY (default :LINEAR-BDD,
+;;;;   the 0.1 behaviour), BUDGET, TIMEOUT, ORDER, PHASE, HINT and
+;;;;   lexicographic objectives (:lex O1 ... On): specified in minimize.lisp.
+;;;;   With the 0.1 arguments the result is the 0.1 result plus OPTIMAL-P T;
+;;;;   unsatisfiable is still exactly (values NIL NIL).
 ;;;;
-;;;; (unsat-core formula &key assumptions named backend) -> (values CORE T) or
-;;;;   (values NIL NIL) when FORMULA plus every assumption and every named formula
-;;;;   is satisfiable. NAMED: alist (name . formula), soft like ASSUMPTIONS.
-;;;;   FORMULA is hard. CORE lists the ASSUMPTIONS elements (EQ, given order) and
-;;;;   then the NAMED names (given order) of a minimal unsatisfiable subset:
-;;;;   FORMULA plus CORE is unsatisfiable, and dropping any one element makes it
-;;;;   satisfiable. FORMULA alone unsatisfiable -> (values NIL T).
+;;;; (unsat-core formula &key assumptions named backend (minimal t))
+;;;;   -> (values CORE T) or (values NIL NIL) when FORMULA plus every assumption
+;;;;   and every named formula is satisfiable. NAMED: alist (name . formula), soft
+;;;;   like ASSUMPTIONS. FORMULA is hard. CORE lists the ASSUMPTIONS elements (EQ,
+;;;;   given order) and then the NAMED names (given order) of a minimal
+;;;;   unsatisfiable subset: FORMULA plus CORE is unsatisfiable, and dropping any
+;;;;   one element makes it satisfiable. FORMULA alone unsatisfiable ->
+;;;;   (values NIL T).
+;;;;   0.2, MINIMAL NIL: the same mapping over BACKEND-FINAL-CONFLICT instead of
+;;;;   BACKEND-UNSAT-CORE: FORMULA plus CORE is unsatisfiable, CORE need not be
+;;;;   minimal (when FORMULA alone is unsatisfiable it may be any subset).
 
 (in-package #:sat-protocol)
 
@@ -163,55 +196,73 @@ cheaper value. Returns (values literals cost)."
               (loop for (weight . l) in objective
                     when (eq (gethash (abs l) assigned) (plusp l)) sum weight)))))
 
-(defgeneric backend-minimize (backend cnf objective &key assumptions)
-  (:documentation "Least-cost model. Default method: iterated BACKEND-SOLVE with a tightened bound.")
-  (:method ((backend sat-backend) cnf objective &key assumptions)
-    ;; Linear SAT-UNSAT descent. After a model of cost C, assert
-    ;; "cost <= C-1" with a BDD over the objective entries: node N(i,k) means
-    ;; "entries i.. weigh at most k when true", clauses (-N -l_i N(i+1,k-w_i))
-    ;; and (-N l_i N(i+1,k)). The node table is shared by every tightening.
-    ;; The bound is clauses, so every completion of a partial answer meets it,
-    ;; and the cheapest completion strictly lowers the cost each round.
-    (let* ((work (copy-cnf cnf))
-           (terms (coerce objective 'vector))
-           (n (length terms))
-           (suffix (make-array (1+ n) :initial-element 0))
-           (memo (make-hash-table :test 'equal))
-           (best-literals nil)
-           (best nil))
-      (loop for i from (1- n) downto 0
-            do (setf (aref suffix i) (+ (aref suffix (1+ i)) (car (aref terms i)))))
-      (labels ((node (i k)
-                 (cond ((minusp k) :false)
-                       ((>= k (aref suffix i)) :true)
-                       (t (let ((key (cons i k)))
-                            (or (gethash key memo)
-                                (setf (gethash key memo)
-                                      (destructuring-bind (weight . l) (aref terms i)
-                                        ;; children first (post-order allocation)
-                                        (let* ((hi (node (1+ i) (- k weight)))
-                                               (lo (node (1+ i) k))
-                                               (x (cnf-ensure-variable work nil)))
-                                          (flet ((imply (lit child)
-                                                   (unless (eq child :true)
-                                                     (cnf-add-clause work (if (eq child :false)
-                                                                              (list (- x) lit)
-                                                                              (list (- x) lit child))))))
-                                            (imply (- l) hi)
-                                            (imply l lo))
-                                          x)))))))))
-        (loop
-          (multiple-value-bind (literals sat)
-              (backend-solve backend work :assumptions assumptions)
-            (unless sat (return))
-            (multiple-value-setq (best-literals best) (%cheapest-completion literals objective))
-            (when (zerop best) (return))
-            (let ((root (node 0 (1- best))))
-              (when (symbolp root) (return)) ; unreachable for 0 < best <= sum of weights
-              (cnf-add-clause work (list root))))))
-      (if best
-          (values best-literals best)
-          (values nil nil)))))
+(defun %linear-bdd (backend cnf objective assumptions)
+  "The 0.1 default method (GIVEN, unchanged but for the third value):
+unbudgeted linear descent with a BDD bound over a plain integer OBJECTIVE.
+Returns (values literals cost T), or (values NIL NIL). 0.2's :LINEAR-BDD
+strategy (minimize.lisp) may reuse or replace it; with the 0.1 arguments its
+results must not change."
+  ;; Linear SAT-UNSAT descent. After a model of cost C, assert
+  ;; "cost <= C-1" with a BDD over the objective entries: node N(i,k) means
+  ;; "entries i.. weigh at most k when true", clauses (-N -l_i N(i+1,k-w_i))
+  ;; and (-N l_i N(i+1,k)). The node table is shared by every tightening.
+  ;; The bound is clauses, so every completion of a partial answer meets it,
+  ;; and the cheapest completion strictly lowers the cost each round.
+  (let* ((work (copy-cnf cnf))
+         (terms (coerce objective 'vector))
+         (n (length terms))
+         (suffix (make-array (1+ n) :initial-element 0))
+         (memo (make-hash-table :test 'equal))
+         (best-literals nil)
+         (best nil))
+    (loop for i from (1- n) downto 0
+          do (setf (aref suffix i) (+ (aref suffix (1+ i)) (car (aref terms i)))))
+    (labels ((node (i k)
+               (cond ((minusp k) :false)
+                     ((>= k (aref suffix i)) :true)
+                     (t (let ((key (cons i k)))
+                          (or (gethash key memo)
+                              (setf (gethash key memo)
+                                    (destructuring-bind (weight . l) (aref terms i)
+                                      ;; children first (post-order allocation)
+                                      (let* ((hi (node (1+ i) (- k weight)))
+                                             (lo (node (1+ i) k))
+                                             (x (cnf-ensure-variable work nil)))
+                                        (flet ((imply (lit child)
+                                                 (unless (eq child :true)
+                                                   (cnf-add-clause work (if (eq child :false)
+                                                                            (list (- x) lit)
+                                                                            (list (- x) lit child))))))
+                                          (imply (- l) hi)
+                                          (imply l lo))
+                                        x)))))))))
+      (loop
+        (multiple-value-bind (literals sat)
+            (backend-solve backend work :assumptions assumptions)
+          (unless sat (return))
+          (multiple-value-setq (best-literals best) (%cheapest-completion literals objective))
+          (when (zerop best) (return))
+          (let ((root (node 0 (1- best))))
+            (when (symbolp root) (return)) ; unreachable for 0 < best <= sum of weights
+            (cnf-add-clause work (list root))))))
+    (if best
+        (values best-literals best t)
+        (values nil nil))))
+
+(defgeneric backend-minimize (backend cnf objective
+                                      &key assumptions strategy budget timeout order phase hint)
+  (:documentation "Least-cost model. Default method: the strategies of
+minimize.lisp on BACKEND-SOLVE / BACKEND-FINAL-CONFLICT; with the 0.1 arguments
+only, the 0.1 linear descent (%LINEAR-BDD).")
+  (:method ((backend sat-backend) cnf objective
+            &key assumptions (strategy :linear-bdd) budget timeout order phase hint)
+    (if (and (eq strategy :linear-bdd)
+             (null budget) (null timeout) (null order) (null phase) (null hint)
+             (not (eq (first objective) :lex)))
+        (%linear-bdd backend cnf objective assumptions)
+        (%minimize backend cnf objective
+                   :assumptions assumptions :strategy strategy :budget budget
+                   :timeout timeout :order order :phase phase :hint hint))))
 
 (defgeneric backend-unsat-core (backend cnf assumptions)
   (:documentation "Minimal unsatisfiable subset of ASSUMPTIONS. Default method: deletion.")
@@ -228,6 +279,15 @@ cheaper value. Returns (values literals cost)."
                   when (sat-p (revappend kept (rest tail)))
                     do (push (first tail) kept))
             (values (nreverse kept) t))))))
+
+(defgeneric backend-final-conflict (backend cnf assumptions &key budget order phase)
+  (:documentation "0.2: BACKEND-SOLVE under ASSUMPTIONS that also explains an
+UNSAT answer with a cheap core (a sublist of ASSUMPTIONS, not necessarily
+minimal). Default method: one BACKEND-SOLVE call; UNSAT -> all of ASSUMPTIONS.
+See the header of protocol.lisp.")
+  (:method ((backend sat-backend) cnf assumptions &key budget order phase)
+    (declare (ignore cnf assumptions budget order phase))
+    (%l2b1-pending 'backend-final-conflict)))
 
 ;;; ------------------------------------------------------------ front ends
 
@@ -337,41 +397,49 @@ when FILL is a function, else left out."
                                           t))
                                 (values nil nil))))))))))
 
-(defun minimize (formula objective &key assumptions backend)
+(defun minimize (formula objective &key assumptions backend (strategy :linear-bdd)
+                         budget timeout order phase hint)
+  ;; 0.2 arguments: minimize.lisp. The 0.1 path below is GIVEN.
+  (when (or (not (eq strategy :linear-bdd)) budget timeout order phase hint
+            (and (consp objective) (eq (first objective) :lex)))
+    (return-from minimize (%l2b1-pending 'minimize)))
   (catch '%sat-front-value
     (let* ((backend (%resolve-backend backend formula))
            (cnf (%working-cnf formula))
            (ints-objective
-             (mapcar (lambda (entry)
-                       (check-type entry cons)
-                       (let ((weight (car entry)))
-                         (check-type weight (integer 0 *))
-                         (cons weight (cnf-literal cnf (cdr entry)))))
-                     objective))
+            (mapcar (lambda (entry)
+                      (check-type entry cons)
+                      (let ((weight (car entry)))
+                        (check-type weight (integer 0 *))
+                        (cons weight (cnf-literal cnf (cdr entry)))))
+                    objective))
            (ints (%integer-literals cnf assumptions)))
-      (multiple-value-bind (literals cost)
+      (multiple-value-bind (literals cost optimal-p)
           (backend-minimize backend cnf ints-objective :assumptions ints)
         (if cost
-            (values (%model cnf literals (constantly nil)) cost)
+            (values (%model cnf literals (constantly nil)) cost optimal-p)
             (values nil nil))))))
 
-(defun unsat-core (formula &key assumptions named backend)
+(defun unsat-core (formula &key assumptions named backend (minimal t))
   (catch '%sat-front-value
     (let* ((backend (%resolve-backend backend formula))
            (cnf (%working-cnf formula))
            (ints (%integer-literals cnf assumptions))
            (selectors
-             (loop for (nil . soft) in named
-                   collect (let ((soft (%check-formula soft)))
-                             (dolist (name (formula-variables soft))
-                               (cnf-ensure-variable cnf name))
-                             ;; An auxiliary selector S with clauses S -> SOFT.
-                             (let ((s (cnf-ensure-variable cnf nil)))
-                               (%add-formula cnf soft s)
-                               s))))
+            (loop for (nil . soft) in named
+                  collect (let ((soft (%check-formula soft)))
+                            (dolist (name (formula-variables soft))
+                              (cnf-ensure-variable cnf name))
+                            ;; An auxiliary selector S with clauses S -> SOFT.
+                            (let ((s (cnf-ensure-variable cnf nil)))
+                              (%add-formula cnf soft s)
+                              s))))
            (all (append ints selectors))
            (objects (append assumptions (mapcar #'car named))))
-      (multiple-value-bind (core unsat) (backend-unsat-core backend cnf all)
+      (multiple-value-bind (core unsat)
+          (if minimal
+              (backend-unsat-core backend cnf all)
+              (backend-final-conflict backend cnf all)) ; 0.2
         (if unsat
             ;; By position: CORE is a subsequence of ALL, so walk both.
             (values (loop for i in all
