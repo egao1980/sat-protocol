@@ -162,16 +162,18 @@
 
 ;;; ------------------------------------------------------------- front end
 
-(defun %index-objective (cnf objective)
-  "OBJECTIVE (plain, or (:lex O1 ... On) with n >= 1) checked and mapped to
-integer literals of CNF (TYPE-ERROR for a bad level, entry or weight)."
+(defun %map-objective (objective literal)
+  "OBJECTIVE (plain, or (:lex O1 ... On) with n >= 1) checked (TYPE-ERROR for a
+bad level, entry or weight), each entry's literal mapped by the function
+LITERAL. A fresh objective. Shared by %INDEX-OBJECTIVE and, 0.3,
+SESSION-MINIMIZE (session literals)."
   (flet ((plain (level)
            (check-type level list)
            (mapcar (lambda (entry)
                      (check-type entry cons)
                      (let ((weight (car entry)))
                        (check-type weight (integer 0 *))
-                       (cons weight (cnf-literal cnf (cdr entry)))))
+                       (cons weight (funcall literal (cdr entry)))))
                    level)))
     (if (and (consp objective) (eq (first objective) :lex))
         (let ((levels (rest objective)))
@@ -180,6 +182,11 @@ integer literals of CNF (TYPE-ERROR for a bad level, entry or weight)."
                                :expected-type '(cons (eql :lex) (cons list list))))
           (cons :lex (mapcar #'plain levels)))
         (plain objective))))
+
+(defun %index-objective (cnf objective)
+  "OBJECTIVE (plain, or (:lex O1 ... On) with n >= 1) checked and mapped to
+integer literals of CNF (TYPE-ERROR for a bad level, entry or weight)."
+  (%map-objective objective (lambda (literal) (cnf-literal cnf literal))))
 
 (defun %hint-literal (cnf element)
   "A HINT element as an integer literal of CNF: (name . boolean) gives the
@@ -239,7 +246,9 @@ one BACKEND-MINIMIZE call at index level, then the complete MODEL."
   hint-table     ; v -> value of the hint (own phases)
   metered budget timeout start (used 0) (calls 0)
   best best-cost best-table           ; the incumbent: literals, cost list, v -> value
-  (tag (list '%stop)))                ; fresh per call: out of limits with an incumbent
+  (tag (list '%stop))                 ; fresh per call: out of limits with an incumbent
+  lex                                 ; 0.3: the objective is (:lex ...): costs are lists
+  budget-reached)                     ; 0.3, sessions only: SIGNAL SAT-BUDGET-REACHED first
 
 (defun %normalize-level (entries)
   (let ((table (make-hash-table)) (vars '()) (offset 0) (softs '()))
@@ -369,14 +378,47 @@ incumbent's value, else the hint's, else T; the search's auxiliaries NIL."
         :interactive %read-value
         (%front-value value)))))
 
+(defun %signal-reached (s)
+  "0.3, SESSION-MINIMIZE's searches only (slot BUDGET-REACHED): out of budget
+with an incumbent. SIGNAL SAT-BUDGET-REACHED (conditions.lisp). USE-BEST, or
+SIGNAL returning, stops the search (the stop tag); CONTINUE and STORE-VALUE
+raise the budget and return, so the limits are checked again and the search
+resumes where it stopped."
+  (let ((budget (%s-budget s)))
+    ;; SIGNAL is the restartable form itself, so the restarts are associated
+    ;; with the condition (CLHS 9.1.4.2.4): FIND-RESTART on it sees ours, not
+    ;; the backend's CONTINUE / STORE-VALUE of its own SAT-BUDGET-EXCEEDED.
+    (restart-case (signal 'sat-budget-reached
+                          :budget budget
+                          :cost (if (%s-lex s)
+                                    (copy-list (%s-best-cost s))
+                                    (first (%s-best-cost s))))
+      (use-best ()
+        :report "Stop the search and return the incumbent."
+        (throw (%s-tag s) nil))
+      (continue ()
+        :report "Double the budget and resume the search."
+        (setf (%s-budget s) (* 2 (max budget 1)))
+        (return-from %signal-reached))
+      (store-value (new-budget)
+        :report "Resume the search with another budget (the most decisions of the whole call)."
+        :interactive %read-budget
+        (check-type new-budget (integer 0 *))
+        (setf (%s-budget s) new-budget)
+        (return-from %signal-reached)))
+    ;; No handler took a restart: USE-BEST.
+    (throw (%s-tag s) nil)))
+
 (defun %wait-for-limits (s)
   "Return once both limits allow one more decision or call. Out of them: with
-an incumbent, stop the search; without one, signal (CONTINUE raises the limit,
+an incumbent, stop the search (0.3, a session search: SIGNAL SAT-BUDGET-REACHED
+first when the budget ran out); without one, signal (CONTINUE raises the limit,
 then the limits are checked again)."
   (loop for which = (%exhausted s)
         while which
-        do (when (%s-best-cost s) (throw (%s-tag s) nil))
-           (%signal-exhausted s which)))
+        do (cond ((null (%s-best-cost s)) (%signal-exhausted s which))
+                 ((and (eq which :budget) (%s-budget-reached s)) (%signal-reached s))
+                 (t (throw (%s-tag s) nil)))))
 
 (defun %call (s kind cnf extra)
   "The gate: one BACKEND-SOLVE (KIND :SOLVE) or BACKEND-FINAL-CONFLICT (KIND
@@ -551,10 +593,12 @@ incumbent's (no big-M weights)."
     (%add-pb (%s-base s) terms (%terms-cost terms (%s-best-table s)) :auto nil)))
 
 (defun %minimize (backend cnf objective &key assumptions strategy budget timeout
-                                              order phase hint)
+                                              order phase hint budget-reached)
   "Default method of BACKEND-MINIMIZE for every 0.2 argument (see this file's
 header): STRATEGY on BACKEND-SOLVE / BACKEND-FINAL-CONFLICT, the BUDGET /
-TIMEOUT meter, HINT, and :LEX objectives."
+TIMEOUT meter, HINT, and :LEX objectives. BUDGET-REACHED (0.3, private: only
+the session default methods pass it): out of budget with an incumbent, SIGNAL
+SAT-BUDGET-REACHED before stopping (%SIGNAL-REACHED)."
   (check-type strategy %strategy)
   (check-type budget (or null (integer 0 *)))
   (check-type timeout (or null (real 0 *)))
@@ -565,7 +609,8 @@ TIMEOUT meter, HINT, and :LEX objectives."
                           :assumptions assumptions :order (%total-order order n0)
                           :levels levels :hint-table (%assignment hint)
                           :metered (and (or budget timeout) t) :budget budget :timeout timeout
-                          :start (get-internal-real-time))))
+                          :start (get-internal-real-time)
+                          :lex lex :budget-reached (and budget-reached t))))
     (multiple-value-bind (completion preferences) (%objective-preferences levels)
       (setf (%s-completion s) completion
             (%s-preferences s) preferences))
