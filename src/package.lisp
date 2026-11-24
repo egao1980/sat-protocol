@@ -6,6 +6,11 @@
 ;;;; operator :AT-MOST, CNF-ADD-*), MINIMIZE strategies, budgets, hints and
 ;;;; lexicographic objectives, and BACKEND-FINAL-CONFLICT. Every 0.1 call keeps
 ;;;; its meaning.
+;;;;
+;;;; 0.3.0 (L2b-2) adds incremental sessions (src/session.lisp): SAT-SESSION,
+;;;; its front ends and the BACKEND-SESSION-* GFs, whose default methods solve
+;;;; from scratch, plus the conditions SAT-SESSION-CLOSED and SAT-BUDGET-REACHED
+;;;; (restart USE-BEST). Every 0.2 call keeps its meaning.
 
 (defpackage #:sat-protocol
   (:use #:cl)
@@ -29,6 +34,12 @@
    #:use-backend
    #:skip-line
    #:signal-budget-exceeded
+   #:sat-session-closed                 ; 0.3
+   #:sat-session-closed-session         ; 0.3
+   #:sat-budget-reached                 ; 0.3: not an error
+   #:sat-budget-reached-budget          ; 0.3
+   #:sat-budget-reached-cost            ; 0.3
+   #:use-best                           ; 0.3
 
    ;; formulas (src/formula.lisp)
    #:formula
@@ -108,6 +119,29 @@
    #:solve
    #:solve-all
    #:minimize
-   #:unsat-core))
+   #:unsat-core
+
+   ;; incremental sessions (src/session.lisp, 0.3)
+   #:sat-session
+   #:make-sat-session
+   #:with-sat-session
+   #:close-session
+   #:session-open-p
+   #:session-backend
+   #:session-backend-state
+   #:session-variable-count
+   #:session-cnf
+   #:session-add-variables
+   #:session-add-clauses
+   #:session-solve
+   #:session-minimize
+   #:session-model
+   #:session-unsat-core
+   #:backend-session-open
+   #:backend-session-add-clauses
+   #:backend-session-solve
+   #:backend-session-final-conflict
+   #:backend-session-minimize
+   #:backend-session-close))
 
 (in-package #:sat-protocol)

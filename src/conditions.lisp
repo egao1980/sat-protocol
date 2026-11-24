@@ -31,6 +31,26 @@
 ;;;; SAT-DIMACS-ERROR       READ-DIMACS met a malformed line. SKIP-LINE: ignore the
 ;;;;                        line. CONTINUE (header count mismatches only): accept
 ;;;;                        the actual counts.
+;;;;
+;;;; 0.3 (L2b-2, sessions: the rules are in session.lisp):
+;;;; SAT-SESSION-CLOSED     A session operation on a closed session (every
+;;;;                        operation but CLOSE-SESSION, SESSION-OPEN-P,
+;;;;                        SESSION-BACKEND and SESSION-BACKEND-STATE). Signalled
+;;;;                        before the operation does anything, inside
+;;;;                        RESTART-CASE with USE-VALUE (value): the operation
+;;;;                        returns VALUE (SESSION-SOLVE, SESSION-MINIMIZE,
+;;;;                        SESSION-MODEL and SESSION-UNSAT-CORE return (values
+;;;;                        VALUE NIL)).
+;;;; SAT-BUDGET-REACHED     NOT an error (a CONDITION signalled with SIGNAL).
+;;;;                        SESSION-MINIMIZE spent its :BUDGET with an incumbent.
+;;;;                        BUDGET: that budget; COST: the incumbent's cost (a
+;;;;                        list for :lex). Restarts: USE-BEST: stop and return the
+;;;;                        incumbent; CONTINUE: double the budget (2 x (max BUDGET
+;;;;                        1)) and resume; STORE-VALUE (budget): resume with that
+;;;;                        budget (a non-negative integer, the most decisions of
+;;;;                        the whole call). Unhandled (SIGNAL returns), the call
+;;;;                        takes USE-BEST, so a call without a handler returns
+;;;;                        what MINIMIZE would: the incumbent, OPTIMAL-P NIL.
 
 (in-package #:sat-protocol)
 
@@ -85,6 +105,21 @@
                      (sat-dimacs-error-line c))))
   (:documentation "Malformed DIMACS input. LINE is the offending text (1-based LINE-NUMBER)."))
 
+(define-condition sat-session-closed (sat-error)
+  ((session :initarg :session :reader sat-session-closed-session :initform nil))
+  (:report (lambda (c s)
+             (format s "SAT session ~A is closed" (sat-session-closed-session c))))
+  (:documentation "0.3: an operation on a closed SAT-SESSION."))
+
+(define-condition sat-budget-reached (condition)
+  ((budget :initarg :budget :reader sat-budget-reached-budget :initform nil)
+   (cost :initarg :cost :reader sat-budget-reached-cost :initform nil))
+  (:report (lambda (c s)
+             (format s "SAT search reached its budget of ~D decision~:P with an incumbent of cost ~S"
+                     (sat-budget-reached-budget c) (sat-budget-reached-cost c))))
+  (:documentation "0.3: SESSION-MINIMIZE spent its budget and has an incumbent.
+Not an error: signalled with SIGNAL; unhandled, the call returns the incumbent."))
+
 ;;; Restart helpers. CL's USE-VALUE and CONTINUE cover the others.
 
 (defun use-backend (backend &optional condition)
@@ -92,6 +127,13 @@
   (let ((restart (find-restart 'use-backend condition)))
     (if restart
         (invoke-restart restart backend)
+        (error 'control-error))))
+
+(defun use-best (&optional condition)
+  "0.3: invoke the USE-BEST restart of SAT-BUDGET-REACHED (return the incumbent)."
+  (let ((restart (find-restart 'use-best condition)))
+    (if restart
+        (invoke-restart restart)
         (error 'control-error))))
 
 (defun skip-line (&optional condition)

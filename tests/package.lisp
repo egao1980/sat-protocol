@@ -4,6 +4,10 @@
 ;;;; 0.2 (L2b-1): cardinality-test (constraints and encodings) and
 ;;;; minimize-protocol-test (MINIMIZE / BACKEND-MINIMIZE / BACKEND-FINAL-CONFLICT
 ;;;; wiring). The whole run uses the reference search with unit propagation.
+;;;; 0.3 (L2b-2): session-protocol-test (the session GFs' call contract, the
+;;;; stateless default methods against the fresh front ends, the stateful
+;;;; session path on REFERENCE-SESSION-BACKEND, and every conformance session
+;;;; check run a second time on it).
 
 (defpackage #:sat-protocol/tests
   (:use #:cl #:rove #:sat-protocol)
@@ -30,7 +34,28 @@
                 #:chain-model
                 #:chain-dp
                 #:chain-labelling-cost
-                #:chain-worst-labelling)
+                #:chain-worst-labelling
+                ;; 0.3
+                #:reference-session-backend
+                #:reference-session-clauses
+                #:reference-session-calls
+                #:session-from-clauses
+                #:session-from-cnf
+                #:index-objective
+                #:literals->names
+                #:model-satisfies-p
+                #:brute-sat-over-p
+                #:core-minimal-p
+                #:run-session-checks
+                #:random-clause*
+                #:random-literals*
+                #:random-3sat
+                #:brute-satisfiable-p
+                #:lit-formula
+                #:int-objective->literals
+                #:chain-session-fixture
+                #:chain-lex-objective
+                #:hint-chains)
   (:export #:run-with-reference-backend))
 
 (in-package #:sat-protocol/tests)
