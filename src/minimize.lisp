@@ -114,6 +114,13 @@
 ;;;; out at level i returns the incumbent (optimal for levels < i), its cost at
 ;;;; every level, and OPTIMAL-P NIL. A literal may appear in several levels.
 ;;;;
+;;;; ---------------------------------------------------------- sessions, 0.3
+;;;; SESSION-MINIMIZE (session.lisp) runs this same search, on a copy of the
+;;;; session CNF (stateless) or through the session's GFs (stateful). Its one
+;;;; difference: out of budget with an incumbent it SIGNALs SAT-BUDGET-REACHED
+;;;; (USE-BEST, CONTINUE, STORE-VALUE) before stopping. MINIMIZE and
+;;;; BACKEND-MINIMIZE are unchanged.
+;;;;
 ;;;; ------------------------------------------------------- backend level
 ;;;; BACKEND-MINIMIZE (protocol.lisp header) receives the same arguments at
 ;;;; index level: OBJECTIVE over integer literals (plain or (:lex ...)), HINT

@@ -1,6 +1,6 @@
 (defsystem "sat-protocol"
-  :version "0.2.0"
-  :description "Propositional formulas, CNF (Tseitin), cardinality and pseudo-Boolean constraints, solve / solve-all / minimize (strategies, budgets, lexicographic objectives), unsat cores and DIMACS behind a CLOS SAT solver protocol (stack-sat)"
+  :version "0.3.0"
+  :description "Propositional formulas, CNF (Tseitin), cardinality and pseudo-Boolean constraints, solve / solve-all / minimize (strategies, budgets, lexicographic objectives), unsat cores, incremental sessions and DIMACS behind a CLOS SAT solver protocol (stack-sat)"
   :author "egao1980"
   :license "MIT"
   :depends-on ()
@@ -14,13 +14,15 @@
                (:file "dimacs")
                (:file "model")
                (:file "protocol")
-               (:file "minimize"))
+               (:file "minimize")
+               ;; 0.3 (L2b-2)
+               (:file "session"))
   :in-order-to ((test-op (test-op "sat-protocol/tests"))))
 
 ;;; The backend conformance suite. Backend test systems depend on it and run
 ;;; it with their backend (sat-protocol/conformance:run-conformance).
 (defsystem "sat-protocol/conformance"
-  :depends-on ("sat-protocol" "rove")
+  :depends-on ("sat-protocol" (:version "rove" "0.11.1"))
   :pathname "tests/conformance"
   :serial t
   :components ((:file "package")
@@ -37,10 +39,13 @@
                (:file "lex-test")
                (:file "minimize-budget-test")
                (:file "chain-test")
-               (:file "final-conflict-test")))
+               (:file "final-conflict-test")
+               ;; 0.3 (L2b-2)
+               (:file "session-reference")
+               (:file "session-test")))
 
 (defsystem "sat-protocol/tests"
-  :depends-on ("sat-protocol" "sat-protocol/conformance" "rove")
+  :depends-on ("sat-protocol" "sat-protocol/conformance" (:version "rove" "0.11.1"))
   :pathname "tests"
   :serial t
   :components ((:file "package")
@@ -50,7 +55,9 @@
                (:file "backend-test")
                ;; 0.2 (L2b-1)
                (:file "cardinality-test")
-               (:file "minimize-protocol-test"))
+               (:file "minimize-protocol-test")
+               ;; 0.3 (L2b-2)
+               (:file "session-protocol-test"))
   :perform (test-op (o c)
                     (unless (symbol-call :sat-protocol/tests :run-with-reference-backend)
                       (error "tests failed for ~A" (component-name c)))))

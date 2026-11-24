@@ -121,6 +121,9 @@
 ;;;;   0.2, MINIMAL NIL: the same mapping over BACKEND-FINAL-CONFLICT instead of
 ;;;;   BACKEND-UNSAT-CORE: FORMULA plus CORE is unsatisfiable, CORE need not be
 ;;;;   minimal (when FORMULA alone is unsatisfiable it may be any subset).
+;;;;
+;;;; 0.3: incremental sessions (SAT-SESSION, its front ends and the
+;;;; BACKEND-SESSION-* GFs) are specified in session.lisp.
 
 (in-package #:sat-protocol)
 

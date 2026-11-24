@@ -13,6 +13,12 @@
 ;;;; chain family) and the tests strategy-test, lex-test, minimize-budget-test,
 ;;;; chain-test and final-conflict-test. Instances are sized for a DPLL backend
 ;;;; (each optimum is proven in milliseconds by the 0.1 linear descent).
+;;;;
+;;;; 0.3 (L2b-2) adds session-reference.lisp (REFERENCE-SESSION-BACKEND, a
+;;;; stateful session over the reference search, and the session helpers) and
+;;;; session-test.lisp: sessions against brute force and the fresh front-end
+;;;; calls. Its checks are functions too (DEFINE-SESSION-CHECK), so a suite can
+;;;; run them on a second backend with RUN-SESSION-CHECKS.
 
 (defpackage #:sat-protocol/conformance
   (:use #:cl #:rove #:sat-protocol)
@@ -69,7 +75,37 @@
    #:chain-labelling-cost
    #:chain-model
    #:chain-model-labelling
-   #:chain-worst-labelling))
+   #:chain-worst-labelling
+   ;; 0.3 sessions (session-reference.lisp, session-test.lisp)
+   #:reference-session-backend
+   #:reference-session-clauses
+   #:reference-session-calls
+   #:session-from-clauses
+   #:session-from-cnf
+   #:index-objective
+   #:literals->names
+   #:literal-true-p
+   #:model-shape-ok-p
+   #:model-satisfies-p
+   #:model-cost
+   #:compact-clauses
+   #:brute-sat-over-p
+   #:brute-optimum-over
+   #:core-ok-p
+   #:core-minimal-p
+   #:subsequence-p
+   #:fresh-solve-status
+   #:fresh-minimize
+   #:*session-checks*
+   #:define-session-check
+   #:run-session-checks
+   #:random-clause*
+   #:random-literals*
+   #:random-objective*
+   #:planted-binary
+   #:session-script
+   #:chain-session-fixture
+   #:hint-chains))
 
 (in-package #:sat-protocol/conformance)
 
